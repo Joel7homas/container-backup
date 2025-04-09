@@ -1,0 +1,20 @@
+version: '3.8'
+services:
+  database-backup:
+    image: python:3.12.9-alpine
+    container_name: database-backup
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /mnt/backups/:/backups/:rw
+      - /mnt/backups/backup-script.py:/app/backup-script.py:ro
+    environment:
+      - TZ=America/Denver
+      - BACKUP_RETENTION_DAYS=7
+      - PORTAINER_URL=${PORTAINER_URL}
+      - PORTAINER_API_KEY=${PORTAINER_TOKEN}
+      - EXCLUDE_FROM_BACKUP=${EXCLUDE_FROM_BACKUP}
+      - PYTHONUNBUFFERED=1
+      - CRON_SCHEDULE=01:00  # Run at 1 AM
+    working_dir: /app
+    command: sh -c "pip install docker requests schedule && python3 backup-script.py"
+    restart: unless-stopped
