@@ -25,8 +25,8 @@ RUN apk update && \
     shadow
 
 # Create non-root user
-RUN groupadd -g $GID appuser && \
-    useradd -u $UID -g appuser -s /bin/bash -m appuser
+RUN addgroup -g $GID appuser && \
+    adduser -u $UID -G appuser -s /bin/bash -D appuser
 
 # Create backup directory with proper permissions
 RUN mkdir -p /backups && \
