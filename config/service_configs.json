@@ -1,0 +1,39 @@
+{
+  "wordpress": {
+    "database": {
+      "type": "mysql",
+      "requires_stopping": false,
+      "container_patterns": ["*mysql*", "*mariadb*"]
+    },
+    "files": {
+      "data_paths": ["wp-content"],
+      "requires_stopping": false,
+      "exclusions": ["wp-content/cache/*", "wp-content/debug.log"]
+    },
+    "global": {
+      "backup_retention": 7,
+      "exclude_from_backup": false,
+      "priority": 10
+    }
+  },
+  "nextcloud": {
+    "database": {
+      "type": "postgres",
+      "requires_stopping": false,
+      "container_patterns": ["*postgres*", "*db*"]
+    },
+    "files": {
+      "data_paths": ["data", "config", "themes", "apps"],
+      "requires_stopping": true,
+      "exclusions": ["data/appdata*/cache/*", "data/*/cache/*", "data/*/files_trashbin/*"]
+    },
+    "global": {
+      "mixed_retention": {
+        "daily": 7,
+        "weekly": 4,
+        "monthly": 2
+      },
+      "priority": 20
+    }
+  }
+}
