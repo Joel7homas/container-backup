@@ -61,7 +61,7 @@ class BackupManager:
     
     def run_backups(self, service_names: Optional[List[str]] = None) -> Dict[str, bool]:
         """
-        Run backups for all services or specific services.
+        Run backups for all services or specific services with resource awareness.
         
         Args:
             service_names (list, optional): List of service names to back up.
@@ -72,6 +72,9 @@ class BackupManager:
         """
         start_time = time.time()
         logger.info("Starting backup process")
+        
+        # System resource check before starting
+        self._check_system_resources()
         
         # Discover services
         services = self.service_discovery.discover_services()
@@ -93,10 +96,13 @@ class BackupManager:
         # Update retention configuration from service configs
         self._update_retention_config(services)
         
+        # Determine optimal number of workers based on system resources
+        max_workers = self._get_optimal_worker_count()
+        
         # Run backups in parallel with limited concurrency
         results = {}
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit backup tasks
             future_to_service = {
                 executor.submit(self._run_backup_with_lock, service): service
@@ -107,6 +113,9 @@ class BackupManager:
             for future in concurrent.futures.as_completed(future_to_service):
                 service = future_to_service[future]
                 try:
+                    # Check for resource pressure before processing result
+                    self._throttle_if_needed()
+                    
                     success = future.result()
                     results[service.service_name] = success
                     if success:
@@ -128,6 +137,94 @@ class BackupManager:
                   f"{deleted_count} backups removed by retention policy")
         
         return results
+    
+    def _check_system_resources(self) -> None:
+        """Check system resources and log warnings if resources are low."""
+        try:
+            import psutil
+            
+            # Check disk space
+            disk_usage = psutil.disk_usage(str(self.backup_dir))
+            if disk_usage.percent > 90:
+                logger.warning(f"Low disk space: {disk_usage.free / (1024**3):.1f} GB free ({disk_usage.percent}% used)")
+            
+            # Check CPU load
+            cpu_percent = psutil.cpu_percent(interval=1)
+            if cpu_percent > 80:
+                logger.warning(f"High CPU usage: {cpu_percent}%")
+            
+            # Check memory usage
+            memory = psutil.virtual_memory()
+            if memory.percent > 90:
+                logger.warning(f"Low memory: {memory.available / (1024**3):.1f} GB available ({memory.percent}% used)")
+                
+        except ImportError:
+            logger.debug("psutil not available, skipping resource check")
+        except Exception as e:
+            logger.warning(f"Error checking system resources: {str(e)}")
+    
+    def _get_optimal_worker_count(self) -> int:
+        """
+        Determine optimal number of worker threads based on system resources.
+        
+        Returns:
+            int: Optimal number of worker threads.
+        """
+        try:
+            import psutil
+            
+            # Start with configured max_workers
+            workers = self.max_workers
+            
+            # Get CPU count
+            cpu_count = psutil.cpu_count(logical=True)
+            
+            # Get memory info
+            memory = psutil.virtual_memory()
+            
+            # Get disk IO rates
+            disk_io = psutil.disk_io_counters(perdisk=False)
+            
+            # Adjust based on CPU - don't use more than 75% of CPUs
+            cpu_workers = max(1, int(cpu_count * 0.75))
+            workers = min(workers, cpu_workers)
+            
+            # Adjust based on memory - reduce workers if memory is tight
+            if memory.percent > 80:
+                memory_factor = 1 - ((memory.percent - 80) / 20)  # Scale from 1.0 to 0.0
+                memory_workers = max(1, int(workers * memory_factor))
+                workers = min(workers, memory_workers)
+                
+            # Always allow at least 1 worker
+            return max(1, workers)
+        except ImportError:
+            logger.debug("psutil not available, using configured max_workers")
+            return self.max_workers
+        except Exception as e:
+            logger.warning(f"Error determining optimal worker count: {str(e)}")
+            return self.max_workers
+    
+    def _throttle_if_needed(self) -> None:
+        """Throttle processing if system resources are under pressure."""
+        try:
+            import psutil
+            
+            # Check CPU usage
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            if cpu_percent > 90:
+                logger.debug(f"Throttling due to high CPU usage: {cpu_percent}%")
+                time.sleep(2)  # Sleep for 2 seconds to reduce pressure
+                
+            # Check disk IO
+            if hasattr(psutil, 'disk_io_counters'):
+                disk_io = psutil.disk_io_counters()
+                if disk_io and hasattr(disk_io, 'busy_time') and disk_io.busy_time > 80:
+                    logger.debug("Throttling due to high disk IO")
+                    time.sleep(1)  # Sleep for 1 second
+        except ImportError:
+            pass  # psutil not available
+        except Exception as e:
+            logger.debug(f"Error in throttle check: {str(e)}")
     
     def run_backup_for_service(self, service_name: str) -> bool:
         """
@@ -286,7 +383,7 @@ class BackupManager:
     
     def _create_lock(self, service_name: str) -> Optional[Path]:
         """
-        Create a lock file for a service.
+        Create a lock file for a service with process ID and improved timeout handling.
         
         Args:
             service_name (str): Service name.
@@ -298,23 +395,59 @@ class BackupManager:
         
         # Check if lock already exists
         if lock_path.exists():
-            # Check if lock is stale (older than 6 hours)
-            lock_time = lock_path.stat().st_mtime
-            if time.time() - lock_time > 6 * 3600:
-                logger.warning(f"Removing stale lock for {service_name}")
-                os.remove(lock_path)
-            else:
-                logger.warning(f"Service {service_name} is already being backed up")
-                return None
+            try:
+                # Read lock file to check if it's stale
+                with open(lock_path, 'r') as f:
+                    lock_data = json.loads(f.read())
+                
+                # Get lock timestamp and process ID
+                lock_time = lock_data.get('timestamp', 0)
+                lock_pid = lock_data.get('pid', 0)
+                
+                # Check if process is still running
+                process_running = False
+                if lock_pid > 0:
+                    try:
+                        # Check if process exists (works on Unix-like systems)
+                        os.kill(lock_pid, 0)
+                        process_running = True
+                    except OSError:
+                        # Process does not exist
+                        process_running = False
+                
+                # Check if lock is stale (older than 3 hours or process not running)
+                if time.time() - lock_time > 3 * 3600 or not process_running:
+                    logger.warning(f"Removing stale lock for {service_name} (PID: {lock_pid})")
+                    os.remove(lock_path)
+                else:
+                    logger.warning(f"Service {service_name} is already being backed up (PID: {lock_pid})")
+                    return None
+                    
+            except (json.JSONDecodeError, KeyError, FileNotFoundError) as e:
+                # Lock file is corrupted or was removed - safe to replace
+                logger.warning(f"Lock file for {service_name} is corrupted or was removed: {str(e)}")
+                try:
+                    os.remove(lock_path)
+                except FileNotFoundError:
+                    pass
         
         try:
-            # Generate unique backup name (will be filled in at backup time)
+            # Generate unique backup name
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_name = f"{service_name}_{timestamp}.tar.gz"
             
-            # Create lock file with backup name
+            # Create lock file with process information
+            lock_data = {
+                'service': service_name,
+                'backup_name': backup_name,
+                'timestamp': time.time(),
+                'pid': os.getpid(),
+                'hostname': os.uname().nodename if hasattr(os, 'uname') else 'unknown'
+            }
+            
+            # Write lock file as JSON for better parsing
             with open(lock_path, 'w') as f:
-                f.write(backup_name)
+                f.write(json.dumps(lock_data))
             
             return lock_path
         except Exception as e:
@@ -323,16 +456,26 @@ class BackupManager:
     
     def _remove_lock(self, lock_path: Path) -> None:
         """
-        Remove a lock file.
+        Remove a lock file with improved error handling.
         
         Args:
             lock_path (Path): Path to lock file.
         """
         try:
             if lock_path.exists():
+                # Read lock file to log what we're removing
+                try:
+                    with open(lock_path, 'r') as f:
+                        lock_data = json.loads(f.read())
+                    logger.debug(f"Removing lock for service {lock_data.get('service')} (PID: {lock_data.get('pid')})")
+                except Exception:
+                    pass
+                
+                # Remove the lock file
                 os.remove(lock_path)
+                logger.debug(f"Lock file removed: {lock_path}")
         except Exception as e:
-            logger.error(f"Error removing lock file: {str(e)}")
+            logger.error(f"Error removing lock file {lock_path}: {str(e)}")
     
     def _update_retention_config(self, services: List[ServiceBackup]) -> None:
         """

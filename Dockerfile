@@ -1,9 +1,9 @@
-ARG VERSION=1.0.0-alpha
+FROM python:3.12-alpine
 
+ARG VERSION=1.0.1-alpha
 ARG UID=80920
 ARG GID=80920
 
-FROM python:3.12-alpine
 
 # Set work directory
 WORKDIR /app
