@@ -51,6 +51,7 @@ COPY main.py \
      database_backup.py \
      portainer_client.py \
      retention_manager.py \
+     service_discovery.py \
      /app/
 
 # Set the correct permissions
