@@ -26,8 +26,8 @@ RUN apk update && \
     shadow
 
 # Create non-root user
-RUN addgroup -g ${GID} appuser && \
-    adduser -D -u ${UID} -G appuser -s /bin/bash appuser
+RUN addgroup -g 80920 appuser && \
+    adduser -D -u 80920 -G appuser -s /bin/bash appuser
 
 # Create backup directory with proper permissions
 RUN mkdir -p /backups && \
@@ -40,10 +40,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy project files
-COPY utils/docker_utils.py \ 
-     utils/archive_utils.py \
-     utils/credential_utils.py \
-     /app/utils/
+COPY utils/ /app/utils/
 
 COPY main.py \
      logger.py \
@@ -56,7 +53,6 @@ COPY main.py \
      retention_manager.py \
      /app/
 
-
 # Set the correct permissions
 RUN chown -R appuser:appuser /app
 
@@ -64,7 +60,6 @@ RUN chown -R appuser:appuser /app
 RUN echo '#!/bin/bash' > /entrypoint.sh && \
     echo 'if [ ! -z "$PUID" ] && [ ! -z "$PGID" ]; then' >> /entrypoint.sh && \
     echo '  echo "Changing user/group IDs at runtime to $PUID:$PGID"' >> /entrypoint.sh && \
-    echo '  apk add --no-cache shadow' >> /entrypoint.sh && \
     echo '  groupmod -g $PGID appuser' >> /entrypoint.sh && \
     echo '  usermod -u $PUID appuser' >> /entrypoint.sh && \
     echo '  chown -R appuser:appuser /app /backups' >> /entrypoint.sh && \
