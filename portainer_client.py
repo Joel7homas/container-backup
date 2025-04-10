@@ -11,6 +11,8 @@ import time
 import requests
 from typing import Dict, List, Any, Optional, Union, Tuple
 from urllib3.exceptions import InsecureRequestWarning
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from logger import get_logger
 
@@ -36,14 +38,22 @@ class PortainerClient:
         self.session = self._create_session()
         self.verify_ssl = not os.environ.get('PORTAINER_INSECURE', '').lower() in ('true', '1', 'yes')
         
+        # Get timeouts from environment variables or use defaults
+        self.connect_timeout = int(os.environ.get('PORTAINER_CONNECT_TIMEOUT', '5'))
+        self.read_timeout = int(os.environ.get('PORTAINER_READ_TIMEOUT', '30'))
+        self.retry_total = int(os.environ.get('PORTAINER_RETRY_TOTAL', '3'))
+        self.retry_backoff = float(os.environ.get('PORTAINER_RETRY_BACKOFF', '0.5'))
+        
         if not self.verify_ssl:
             logger.warning("SSL verification is disabled for Portainer API requests")
         
-        logger.info(f"Initialized Portainer client for {self.url}")
+        logger.info(f"Initialized Portainer client for {self.url} "
+                   f"(connect_timeout={self.connect_timeout}s, read_timeout={self.read_timeout}s, "
+                   f"retries={self.retry_total})")
         
         # Cache for API responses
         self._cache = {}
-        self._cache_ttl = 300  # 5 minutes
+        self._cache_ttl = int(os.environ.get('PORTAINER_CACHE_TTL', '300'))  # 5 minutes default
     
     def _create_session(self) -> requests.Session:
         """
@@ -53,16 +63,33 @@ class PortainerClient:
             requests.Session: Configured session object.
         """
         session = requests.Session()
+        
+        # Set up headers
         session.headers.update({
             "X-API-Key": self.api_key,
             "Content-Type": "application/json"
         })
+        
+        # Configure retry strategy
+        retry_strategy = Retry(
+            total=self.retry_total,
+            backoff_factor=self.retry_backoff,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"]
+        )
+        
+        # Mount the adapter to the session
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
         return session
     
     def _make_request(self, method: str, endpoint: str, 
                     params: Optional[Dict[str, Any]] = None,
                     data: Optional[Dict[str, Any]] = None,
-                    cache: bool = False) -> Optional[Dict[str, Any]]:
+                    cache: bool = False,
+                    custom_timeout: Optional[Tuple[int, int]] = None) -> Optional[Dict[str, Any]]:
         """
         Make a request to the Portainer API with retries.
         
@@ -72,11 +99,15 @@ class PortainerClient:
             params (dict, optional): Query parameters.
             data (dict, optional): Request body.
             cache (bool): Whether to cache the response.
+            custom_timeout (tuple, optional): Custom timeout as (connect_timeout, read_timeout).
         
         Returns:
             dict or None: Response data or None if failed.
         """
         url = f"{self.url}{endpoint}"
+        
+        # Use custom timeout if provided, otherwise use defaults
+        timeout = custom_timeout or (self.connect_timeout, self.read_timeout)
         
         # Check cache for GET requests
         cache_key = f"{method}:{endpoint}:{str(params)}"
@@ -86,12 +117,16 @@ class PortainerClient:
                 logger.debug(f"Using cached response for {endpoint}")
                 return cache_entry["data"]
         
-        max_retries = 3
-        retry_delay = 2  # seconds
+        # Custom retry handling for non-retryable errors
+        manual_retries = 2  # Manual retries for connection errors
+        retry_delay = self.retry_backoff
         
-        for attempt in range(max_retries):
+        for manual_attempt in range(manual_retries + 1):
             try:
-                logger.debug(f"Making {method} request to {endpoint}")
+                logger.debug(f"Making {method} request to {endpoint} (timeout={timeout}s)")
+                
+                # Add request timeout monitoring
+                start_time = time.time()
                 
                 response = self.session.request(
                     method=method,
@@ -99,8 +134,17 @@ class PortainerClient:
                     params=params,
                     json=data,
                     verify=self.verify_ssl,
-                    timeout=(5, 30)  # (connect timeout, read timeout)
+                    timeout=timeout
                 )
+                
+                # Log request duration for monitoring
+                duration = time.time() - start_time
+                logger.debug(f"Request to {endpoint} completed in {duration:.2f}s")
+                
+                # Check for slow requests
+                if duration > timeout[1] * 0.8:  # If took more than 80% of timeout
+                    logger.warning(f"Slow request to {endpoint}: {duration:.2f}s "
+                                  f"(close to timeout of {timeout[1]}s)")
                 
                 response.raise_for_status()
                 
@@ -119,13 +163,33 @@ class PortainerClient:
                 
                 return result
             
+            except requests.exceptions.ConnectTimeout as e:
+                logger.warning(f"Connection timeout on {endpoint}: {str(e)}")
+                if manual_attempt < manual_retries:
+                    delay = retry_delay * (2 ** manual_attempt)
+                    logger.info(f"Retrying in {delay}s (attempt {manual_attempt+1}/{manual_retries})")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Failed to connect to {endpoint} after {manual_retries+1} attempts")
+                    return None
+            
+            except requests.exceptions.ReadTimeout as e:
+                logger.warning(f"Read timeout on {endpoint}: {str(e)}")
+                if manual_attempt < manual_retries:
+                    delay = retry_delay * (2 ** manual_attempt)
+                    logger.info(f"Retrying in {delay}s (attempt {manual_attempt+1}/{manual_retries})")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Request to {endpoint} timed out after {manual_retries+1} attempts")
+                    return None
+            
             except requests.exceptions.RequestException as e:
-                logger.warning(f"Request attempt {attempt + 1}/{max_retries} failed: {str(e)}")
-                
-                if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
+                # Other request errors will be handled by the retry adapter
+                logger.warning(f"Request to {endpoint} failed: {str(e)}")
+                if manual_attempt < manual_retries:
+                    delay = retry_delay * (2 ** manual_attempt)
+                    logger.info(f"Retrying in {delay}s (attempt {manual_attempt+1}/{manual_retries})")
+                    time.sleep(delay)
                 else:
                     logger.error(f"Failed to make request to {endpoint} after multiple attempts")
                     return None
@@ -141,7 +205,10 @@ class PortainerClient:
         Returns:
             dict: Dictionary of stack names to stack IDs.
         """
-        result = self._make_request("GET", "/api/stacks", cache=True)
+        # Use a longer timeout for potentially large response
+        result = self._make_request("GET", "/api/stacks", 
+                                 cache=True, 
+                                 custom_timeout=(self.connect_timeout, self.read_timeout * 2))
         
         if not result:
             logger.error("Failed to get stacks from Portainer")
@@ -280,3 +347,36 @@ class PortainerClient:
             return None
         
         return result
+    
+    def clear_cache(self) -> None:
+        """
+        Clear the API response cache.
+        Useful when forced refresh is needed.
+        """
+        cache_size = len(self._cache)
+        self._cache.clear()
+        logger.info(f"Cleared Portainer API cache ({cache_size} entries)")
+    
+    def check_connection(self) -> bool:
+        """
+        Check if connection to Portainer API is working.
+        
+        Returns:
+            bool: True if connection is working, False otherwise.
+        """
+        try:
+            # Use a short timeout for this check
+            result = self._make_request("GET", "/api/status", 
+                                     cache=False, 
+                                     custom_timeout=(2, 5))
+            
+            if result:
+                logger.info(f"Successfully connected to Portainer API")
+                return True
+            else:
+                logger.error(f"Failed to connect to Portainer API")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error checking Portainer API connection: {str(e)}")
+            return False
