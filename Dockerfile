@@ -20,13 +20,14 @@ LABEL version=${VERSION}
 RUN apk update && \
     apk add --no-cache \
     bash \
+    su-exec \
     curl \
     tzdata \
     shadow
 
 # Create non-root user
-RUN addgroup -S -g $GID appuser && \
-    adduser -S -D -u $UID -G appuser -s /bin/bash appuser
+RUN addgroup -g ${GID} appuser && \
+    adduser -D -u ${UID} -G appuser -s /bin/bash appuser
 
 # Create backup directory with proper permissions
 RUN mkdir -p /backups && \
@@ -59,8 +60,20 @@ COPY main.py \
 # Set the correct permissions
 RUN chown -R appuser:appuser /app
 
-# Switch to non-root user
-USER appuser
+# Create an entrypoint script to allow runtime UID/GID modification
+RUN echo '#!/bin/bash' > /entrypoint.sh && \
+    echo 'if [ ! -z "$PUID" ] && [ ! -z "$PGID" ]; then' >> /entrypoint.sh && \
+    echo '  echo "Changing user/group IDs at runtime to $PUID:$PGID"' >> /entrypoint.sh && \
+    echo '  apk add --no-cache shadow' >> /entrypoint.sh && \
+    echo '  groupmod -g $PGID appuser' >> /entrypoint.sh && \
+    echo '  usermod -u $PUID appuser' >> /entrypoint.sh && \
+    echo '  chown -R appuser:appuser /app /backups' >> /entrypoint.sh && \
+    echo 'fi' >> /entrypoint.sh && \
+    echo 'exec su-exec appuser "$@"' >> /entrypoint.sh && \
+    chmod +x /entrypoint.sh
+
+# Switch to the entrypoint script
+ENTRYPOINT ["/entrypoint.sh"]
 
 # Run the application
 CMD ["python", "main.py", "schedule"]
