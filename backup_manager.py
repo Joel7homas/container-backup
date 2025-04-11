@@ -398,19 +398,28 @@ class BackupManager:
             try:
                 # Read lock file to check if it's stale
                 with open(lock_path, 'r') as f:
-                    lock_data = json.loads(f.read())
+                    lock_data_str = f.read().strip()
+                    
+                # Parse lock data - handle both old and new format
+                try:
+                    # Try parsing as JSON (new format)
+                    lock_data = json.loads(lock_data_str)
+                    lock_time = lock_data.get('timestamp', 0)
+                    lock_pid = lock_data.get('pid', 0)
+                except json.JSONDecodeError:
+                    # Old format or corrupted - treat as stale
+                    logger.warning(f"Lock file for {service_name} has invalid format, treating as stale")
+                    os.remove(lock_path)
+                    return self._create_new_lock(service_name, lock_path)
                 
-                # Get lock timestamp and process ID
-                lock_time = lock_data.get('timestamp', 0)
-                lock_pid = lock_data.get('pid', 0)
-                
-                # Check if process is still running
+                # Check if the process still exists
                 process_running = False
                 if lock_pid > 0:
                     try:
                         # Check if process exists (works on Unix-like systems)
-                        os.kill(lock_pid, 0)
-                        process_running = True
+                        if lock_pid != os.getpid():  # Skip check if it's our own process
+                            os.kill(lock_pid, 0)
+                            process_running = True
                     except OSError:
                         # Process does not exist
                         process_running = False
@@ -419,6 +428,7 @@ class BackupManager:
                 if time.time() - lock_time > 3 * 3600 or not process_running:
                     logger.warning(f"Removing stale lock for {service_name} (PID: {lock_pid})")
                     os.remove(lock_path)
+                    return self._create_new_lock(service_name, lock_path)
                 else:
                     logger.warning(f"Service {service_name} is already being backed up (PID: {lock_pid})")
                     return None
@@ -427,10 +437,26 @@ class BackupManager:
                 # Lock file is corrupted or was removed - safe to replace
                 logger.warning(f"Lock file for {service_name} is corrupted or was removed: {str(e)}")
                 try:
-                    os.remove(lock_path)
+                    if lock_path.exists():
+                        os.remove(lock_path)
                 except FileNotFoundError:
                     pass
+                return self._create_new_lock(service_name, lock_path)
         
+        # No existing lock, create a new one
+        return self._create_new_lock(service_name, lock_path)
+    
+    def _create_new_lock(self, service_name: str, lock_path: Path) -> Optional[Path]:
+        """
+        Create a new lock file.
+        
+        Args:
+            service_name (str): Service name.
+            lock_path (Path): Path to lock file.
+            
+        Returns:
+            Path or None: Path to lock file if created, None otherwise.
+        """
         try:
             # Generate unique backup name
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

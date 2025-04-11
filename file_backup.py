@@ -89,68 +89,147 @@ class FileBackup:
                 return False
     
     def _backup_path(self, path: str, temp_dir: str) -> bool:
-            """
-            Back up a single path.
+        """
+        Back up a single path.
+        Handles both running and stopped containers.
+        
+        Args:
+            path (str): Path to back up.
+            temp_dir (str): Temporary directory to store backup.
             
-            Args:
-                path (str): Path to back up.
-                temp_dir (str): Temporary directory to store backup.
-                
-            Returns:
-                bool: True if successful, False otherwise.
-            """
-            logger.debug(f"Backing up path: {path}")
-            
-            # Validate path to prevent command injection
-            if not isinstance(path, str):
-                logger.error(f"Invalid path type: {type(path)}")
-                return False
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        logger.debug(f"Backing up path: {path}")
+        
+        # Validate path to prevent command injection
+        if not isinstance(path, str):
+            logger.error(f"Invalid path type: {type(path)}")
+            return False
     
-            # Check for potentially dangerous characters in path
-            if any(c in path for c in [";", "&&", "||", "`", "$", "|"]):
-                logger.error(f"Invalid characters in path: {path}")
-                return False
+        # Check for potentially dangerous characters in path
+        if any(c in path for c in [";", "&&", "||", "`", "$", "|"]):
+            logger.error(f"Invalid characters in path: {path}")
+            return False
     
-            # Handle root directory special case
-            if path in [".", "/"]:
-                # For root directory, use specific paths and exclusions
-                if not self.exclusions:
-                    self.exclusions = [
-                        "tmp/*", "proc/*", "sys/*", "dev/*", "run/*", "var/cache/*",
-                        "var/tmp/*", "var/log/*", "var/lib/docker/*"
-                    ]
+        # Handle root directory special case
+        if path in [".", "/"]:
+            # For root directory, use specific paths and exclusions
+            if not self.exclusions:
+                self.exclusions = [
+                    "tmp/*", "proc/*", "sys/*", "dev/*", "run/*", "var/cache/*",
+                    "var/tmp/*", "var/log/*", "var/lib/docker/*"
+                ]
+            
+            # Set path to empty string for root
+            path = ""
+        
+        # Normalize path
+        norm_path = path.rstrip("/")
+        
+        # Check if the container is running
+        if hasattr(self.container, 'status') and self.container.status != 'running':
+            return self._backup_path_from_stopped_container(norm_path, temp_dir)
+        
+        # Check if path exists in the running container
+        check_cmd = f"[ -e '{norm_path}' ] && echo 'EXISTS' || echo 'NOT_FOUND'"
+        exit_code, output = exec_in_container(self.container, check_cmd)
+        
+        if exit_code != 0 or "NOT_FOUND" in output:
+            logger.warning(f"Path not found in container: {norm_path}")
+            return False
+        
+        # Determine if this is a volume mount
+        mounts = get_container_mounts(self.container)
+        is_volume_mount = False
+        
+        for mount in mounts:
+            container_path = mount.get("destination", "")
+            if container_path and (container_path == norm_path or 
+                                  norm_path.startswith(container_path + "/")):
+                is_volume_mount = True
+                logger.debug(f"Path {norm_path} is a volume mount")
+                break
+        
+        # Back up the path
+        if is_volume_mount:
+            return self._backup_volume_mount(norm_path, temp_dir)
+        else:
+            return self._backup_container_path(norm_path, temp_dir)
+    
+    def _backup_path_from_stopped_container(self, path: str, temp_dir: str) -> bool:
+        """
+        Back up a path from a stopped container using docker cp.
+        
+        Args:
+            path (str): Path to back up.
+            temp_dir (str): Temporary directory to store backup.
+            
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        logger.info(f"Backing up path from stopped container {self.container.name} using docker cp: {path}")
+        
+        try:
+            # Create a target directory based on the path name
+            target_dir = os.path.join(temp_dir, os.path.basename(path) or "root")
+            os.makedirs(target_dir, exist_ok=True)
+            
+            # Use docker cp to copy data directly (without executing commands in the container)
+            import subprocess
+            
+            # Construct the docker cp command
+            container_id = self.container.id
+            container_path = path or "/"  # Use root if path is empty
+            
+            # When path is /, we need special handling since docker cp behaves differently
+            if container_path == "/":
+                # Create a list of directories to exclude
+                exclude_dirs = ['proc', 'sys', 'dev', 'tmp', 'run', 'var/cache', 'var/tmp', 'var/log']
+                exclude_args = ' '.join([f'--exclude=/{d}' for d in exclude_dirs])
                 
-                # Set path to empty string for root
-                path = ""
-            
-            # Normalize path
-            norm_path = path.rstrip("/")
-            
-            # Check if path exists
-            check_cmd = f"[ -e '{norm_path}' ] && echo 'EXISTS' || echo 'NOT_FOUND'"
-            exit_code, output = exec_in_container(self.container, check_cmd)
-            
-            if "NOT_FOUND" in output:
-                logger.warning(f"Path not found in container: {norm_path}")
-                return False
-            
-            # Determine if this is a volume mount
-            mounts = get_container_mounts(self.container)
-            is_volume_mount = False
-            
-            for mount in mounts:
-                container_path = mount.get("destination", "")
-                if container_path and (container_path == norm_path or 
-                                      norm_path.startswith(container_path + "/")):
-                    is_volume_mount = True
-                    logger.debug(f"Path {norm_path} is a volume mount")
-                    break
-            
-            # Back up the path
-            if is_volume_mount:
-                return self._backup_volume_mount(norm_path, temp_dir)
+                # Use tar to create an archive of the root directory with exclusions
+                cmd = f"docker cp {container_id}:/ - | tar {exclude_args} -xf - -C {target_dir}"
             else:
-                return self._backup_container_path(norm_path, temp_dir)
+                # Handle exclusion patterns for specific paths
+                if self.exclusions and path:
+                    # Create a temporary tar file
+                    temp_tar = os.path.join(temp_dir, "temp_backup.tar")
+                    
+                    # First copy to a tar file
+                    cp_cmd = f"docker cp {container_id}:{container_path} - > {temp_tar}"
+                    cp_result = subprocess.run(cp_cmd, shell=True, capture_output=True, text=True)
+                    
+                    if cp_result.returncode != 0:
+                        logger.error(f"Failed to docker cp from stopped container: {cp_result.stderr}")
+                        return False
+                    
+                    # Then extract with exclusions
+                    exclusion_args = ' '.join([f'--exclude="{excl}"' for excl in self.exclusions])
+                    extract_cmd = f"tar -xf {temp_tar} {exclusion_args} -C {target_dir}"
+                    extract_result = subprocess.run(extract_cmd, shell=True, capture_output=True, text=True)
+                    
+                    if extract_result.returncode != 0:
+                        logger.error(f"Failed to extract with exclusions: {extract_result.stderr}")
+                        return False
+                    
+                    # Clean up temp file
+                    os.remove(temp_tar)
+                else:
+                    # Simple case - direct copy with no exclusions
+                    cmd = f"docker cp {container_id}:{container_path} {target_dir}"
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                    
+                    if result.returncode != 0:
+                        logger.error(f"Failed to docker cp from stopped container: {result.stderr}")
+                        return False
+            
+            logger.info(f"Successfully backed up path {path} from stopped container {self.container.name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error backing up path {path} from stopped container {self.container.name}: {str(e)}")
+            return False
     
     def _backup_volume_mount(self, volume: str, output_dir: str) -> bool:
             """
