@@ -58,7 +58,7 @@ def compress_directory(directory: str, output_file: str) -> bool:
 
 def extract_archive(archive_file: str, output_dir: str) -> bool:
     """
-    Extract an archive to a directory.
+    Extract an archive to a directory with optimized handling for large files.
     
     Args:
         archive_file (str): Archive file path.
@@ -75,37 +75,101 @@ def extract_archive(archive_file: str, output_dir: str) -> bool:
         return False
     
     # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except (PermissionError, OSError) as e:
+        logger.error(f"Failed to create output directory {output_dir}: {str(e)}")
+        return False
+    
+    # Create a temporary extraction directory to ensure consistency
+    temp_dir = Path(f"{output_dir}.tmp")
     
     try:
+        # Remove temp dir if it exists from a previous failed attempt
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+            
+        # Create temporary directory
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Get archive size for progress reporting
+        archive_size = archive_file.stat().st_size
+        logger.debug(f"Extracting archive: {archive_file} ({archive_size / (1024*1024):.2f} MB)")
+        
         # Determine archive type based on extension
         suffix = archive_file.suffix.lower()
         
         if suffix == '.zip':
             with zipfile.ZipFile(archive_file, 'r') as zip_ref:
-                zip_ref.extractall(output_dir)
+                # Get file count for progress reporting
+                file_count = len(zip_ref.infolist())
+                logger.debug(f"ZIP archive contains {file_count} files")
+                
+                # Extract file by file with progress reporting
+                for i, file_info in enumerate(zip_ref.infolist()):
+                    zip_ref.extract(file_info, temp_dir)
+                    if file_count > 100 and i % int(file_count / 10) == 0:
+                        logger.debug(f"Extraction progress: {(i / file_count) * 100:.1f}%")
+                
                 logger.info(f"Extracted ZIP archive to {output_dir}")
-                return True
                 
         elif archive_file.name.endswith(('.tar.gz', '.tgz')) or suffix == '.gz':
             with tarfile.open(archive_file, 'r:gz') as tar_ref:
-                tar_ref.extractall(output_dir)
+                # Get member count for progress logging
+                members = tar_ref.getmembers()
+                member_count = len(members)
+                logger.debug(f"TAR archive contains {member_count} members")
+                
+                # Extract file by file with progress reporting
+                for i, member in enumerate(members):
+                    tar_ref.extract(member, temp_dir)
+                    if member_count > 100 and i % int(member_count / 10) == 0:
+                        logger.debug(f"Extraction progress: {(i / member_count) * 100:.1f}%")
+                
                 logger.info(f"Extracted TAR.GZ archive to {output_dir}")
-                return True
                 
         else:
             logger.error(f"Unsupported archive format: {suffix}")
+            shutil.rmtree(temp_dir)
             return False
+        
+        # If existing output directory has content, move it to a backup
+        if output_dir.exists() and any(output_dir.iterdir()):
+            backup_dir = Path(f"{output_dir}.bak")
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir)
+            shutil.move(output_dir, backup_dir)
+            logger.debug(f"Created backup of existing contents at {backup_dir}")
+        
+        # Move temporary directory to final location
+        # First ensure the output directory exists but is empty
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Move content from temp dir to final location
+        for item in temp_dir.iterdir():
+            shutil.move(str(item), str(output_dir))
+        
+        # Clean up temporary directory
+        shutil.rmtree(temp_dir)
+        
+        return True
             
     except Exception as e:
         logger.error(f"Error extracting archive {archive_file}: {str(e)}")
+        # Clean up temp dir if exists
+        if temp_dir.exists():
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass
         return False
-
 
 def create_tar_gz(source_dir: str, output_file: str, 
                  exclusions: Optional[List[str]] = None) -> bool:
     """
-    Create a tar.gz archive.
+    Create a tar.gz archive with optimized handling for large files.
     
     Args:
         source_dir (str): Source directory.
@@ -123,6 +187,9 @@ def create_tar_gz(source_dir: str, output_file: str,
         logger.error(f"Source directory does not exist: {source_dir}")
         return False
     
+    # Create a temporary output file to ensure atomic writes
+    temp_output_file = Path(f"{output_file}.tmp")
+    
     try:
         # Create parent directory for output file if it doesn't exist
         os.makedirs(output_file.parent, exist_ok=True)
@@ -130,19 +197,48 @@ def create_tar_gz(source_dir: str, output_file: str,
         # Process exclusions
         excluded_files = _get_excluded_files(source_dir, exclusions)
         
-        # Create tar.gz archive
-        with tarfile.open(output_file, 'w:gz') as tar:
+        # Estimate archive size for progress reporting
+        total_size = 0
+        file_count = 0
+        for item in source_dir.rglob('*'):
+            if item.is_file() and item not in excluded_files:
+                total_size += item.stat().st_size
+                file_count += 1
+        
+        # Create tar.gz archive with streaming (chunk-based processing)
+        logger.debug(f"Archiving approximately {file_count} files ({total_size / (1024*1024):.2f} MB)")
+        
+        # Set compression level based on file size
+        # Use faster compression for large archives
+        compression_level = 1 if total_size > 100 * 1024 * 1024 else 6
+        
+        processed_size = 0
+        with tarfile.open(temp_output_file, f'w:gz', compresslevel=compression_level) as tar:
             for item in source_dir.rglob('*'):
                 if item.is_file() and item not in excluded_files:
                     arcname = item.relative_to(source_dir)
                     tar.add(item, arcname=arcname)
-                    logger.debug(f"Added to archive: {arcname}")
+                    
+                    processed_size += item.stat().st_size
+                    if total_size > 0:
+                        progress = (processed_size / total_size) * 100
+                        if file_count > 100 and int(progress) % 10 == 0:
+                            logger.debug(f"Archive progress: {progress:.1f}% ({processed_size / (1024*1024):.2f} MB)")
         
-        logger.info(f"Created tar.gz archive: {output_file}")
+        # Move the temporary file to the final location (atomic operation)
+        shutil.move(temp_output_file, output_file)
+        
+        logger.info(f"Created tar.gz archive: {output_file} ({os.path.getsize(output_file) / (1024*1024):.2f} MB)")
         return True
         
     except Exception as e:
         logger.error(f"Error creating tar.gz archive: {str(e)}")
+        # Clean up temporary file if exists
+        if temp_output_file.exists():
+            try:
+                temp_output_file.unlink()
+            except Exception:
+                pass
         return False
 
 

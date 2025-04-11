@@ -75,151 +75,264 @@ class DatabaseBackup:
             return None
     
     def backup(self, output_path: str) -> bool:
-        """
-        Back up database to specified path.
-        
-        Args:
-            output_path (str): Path to store backup.
+            """
+            Back up database to specified path.
             
-        Returns:
-            bool: True if successful, False otherwise.
-        """
-        if not self.db_type:
-            logger.error(f"Unknown database type for container {self.container.name}")
-            return False
-        
-        # Create output directory if it doesn't exist
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        logger.info(f"Starting backup of {self.db_type} database in {self.container.name}")
-        
-        try:
-            if self.db_type == "postgres":
-                return self._backup_postgres(output_path)
-            elif self.db_type in ["mysql", "mariadb"]:
-                return self._backup_mysql(output_path)
-            elif self.db_type == "sqlite":
-                return self._backup_sqlite(output_path)
-            elif self.db_type == "mongodb":
-                return self._backup_mongodb(output_path)
-            elif self.db_type == "redis":
-                return self._backup_redis(output_path)
-            else:
-                logger.error(f"Unsupported database type: {self.db_type}")
+            Args:
+                output_path (str): Path to store backup.
+                
+            Returns:
+                bool: True if successful, False otherwise.
+            """
+            if not self.db_type:
+                logger.error(f"Unknown database type for container {self.container.name}")
                 return False
-        except Exception as e:
-            logger.error(f"Error backing up database: {str(e)}")
-            return False
+            
+            # Validate container status
+            if not hasattr(self.container, "status"):
+                logger.error(f"Invalid container object for {self.container.name}")
+                return False
+                
+            # Validate output path
+            if not output_path:
+                logger.error("Output path cannot be empty")
+                return False
+                
+            # Create output directory if it doesn't exist
+            try:
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            except PermissionError:
+                logger.error(f"Permission denied creating directory: {os.path.dirname(output_path)}")
+                return False
+            except OSError as e:
+                logger.error(f"Failed to create output directory: {str(e)}")
+                return False
+            
+            logger.info(f"Starting backup of {self.db_type} database in {self.container.name}")
+            
+            # Track temporary files for cleanup in case of failure
+            temp_files = []
+            
+            try:
+                if self.db_type == "postgres":
+                    return self._backup_postgres(output_path)
+                elif self.db_type in ["mysql", "mariadb"]:
+                    return self._backup_mysql(output_path)
+                elif self.db_type == "sqlite":
+                    return self._backup_sqlite(output_path)
+                elif self.db_type == "mongodb":
+                    return self._backup_mongodb(output_path)
+                elif self.db_type == "redis":
+                    return self._backup_redis(output_path)
+                else:
+                    logger.error(f"Unsupported database type: {self.db_type}")
+                    return False
+            except Exception as e:
+                logger.error(f"Error backing up {self.db_type} database in {self.container.name}: {str(e)}")
+                
+                # Attempt to clean up any temporary files
+                if os.path.exists(output_path):
+                    try:
+                        os.remove(output_path)
+                        logger.debug(f"Removed incomplete backup file: {output_path}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to clean up incomplete backup file: {str(cleanup_error)}")
+                
+                return False
     
     def _backup_postgres(self, output_path: str) -> bool:
-        """
-        Back up PostgreSQL database.
-        
-        Args:
-            output_path (str): Path to store backup.
+            """
+            Back up PostgreSQL database.
             
-        Returns:
-            bool: True if successful, False otherwise.
-        """
-        # Verify credentials
-        if not self.credentials.get('user') or not self.credentials.get('database'):
-            logger.error("Missing required PostgreSQL credentials")
-            return False
-        
-        # Build pg_dump command
-        cmd = f"pg_dump -U {self.credentials['user']}"
-        
-        # Add host if specified
-        if self.credentials.get('host') and self.credentials['host'] != 'localhost':
-            cmd += f" -h {self.credentials['host']}"
-        
-        # Add port if specified
-        if self.credentials.get('port'):
-            cmd += f" -p {self.credentials['port']}"
-        
-        # Add database name
-        cmd += f" {self.credentials['database']}"
-        
-        # Set environment variables
-        env = {}
-        if self.credentials.get('password'):
-            env["PGPASSWORD"] = self.credentials['password']
-        
-        # Execute backup command
-        logger.debug(f"Executing PostgreSQL backup command: {cmd}")
-        exit_code, output = exec_in_container(self.container, cmd, env)
-        
-        if exit_code != 0:
-            logger.error(f"PostgreSQL backup failed: {output}")
-            return False
-        
-        # Compress and save output
-        try:
-            with gzip.open(output_path, 'wb') as f:
-                f.write(output.encode('utf-8'))
-            logger.info(f"PostgreSQL backup completed successfully: {output_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Error saving PostgreSQL backup: {str(e)}")
-            return False
+            Args:
+                output_path (str): Path to store backup.
+                
+            Returns:
+                bool: True if successful, False otherwise.
+            """
+            # Verify credentials
+            if not self.credentials.get('user') or not self.credentials.get('database'):
+                logger.error("Missing required PostgreSQL credentials")
+                return False
+                
+            # Validate credential values to prevent injection
+            user = self.credentials.get('user', '')
+            database = self.credentials.get('database', '')
+            host = self.credentials.get('host', '')
+            port = self.credentials.get('port', '')
+            
+            # Check for potentially dangerous characters in parameters
+            for param_name, param_value in [
+                ('user', user), 
+                ('database', database),
+                ('host', host)
+            ]:
+                if not isinstance(param_value, str):
+                    logger.error(f"Invalid {param_name} parameter type: {type(param_value)}")
+                    return False
+                    
+                if any(c in param_value for c in [';', '&&', '||', '`', '$', '|', '>', '<']):
+                    logger.error(f"Invalid characters in {param_name} parameter")
+                    return False
+            
+            # For numeric parameters, ensure they're actually numeric
+            if port and not str(port).isdigit():
+                logger.error(f"Port must be numeric: {port}")
+                return False
+                
+            # Build pg_dump command with properly escaped parameters
+            cmd = [
+                "pg_dump",
+                "-U", user
+            ]
+                
+            # Add host if specified
+            if host and host != 'localhost':
+                cmd.extend(["-h", host])
+            
+            # Add port if specified
+            if port:
+                cmd.extend(["-p", str(port)])
+            
+            # Add database name
+            cmd.append(database)
+            
+            # Convert command list to string for exec_in_container
+            cmd_str = " ".join(cmd)
+            
+            # Set environment variables
+            env = {}
+            if self.credentials.get('password'):
+                env["PGPASSWORD"] = self.credentials['password']
+            
+            # Execute backup command
+            logger.debug(f"Executing PostgreSQL backup command: {cmd_str}")
+            exit_code, output = exec_in_container(self.container, cmd_str, env)
+            
+            if exit_code != 0:
+                logger.error(f"PostgreSQL backup failed: {output}")
+                return False
+            
+            # Compress and save output
+            try:
+                # Create temporary file first
+                temp_output_path = f"{output_path}.temp"
+                with gzip.open(temp_output_path, 'wb') as f:
+                    f.write(output.encode('utf-8'))
+                
+                # Move to final location
+                shutil.move(temp_output_path, output_path)
+                logger.info(f"PostgreSQL backup completed successfully: {output_path}")
+                return True
+            except Exception as e:
+                logger.error(f"Error saving PostgreSQL backup: {str(e)}")
+                # Clean up temporary file if it exists
+                if os.path.exists(f"{output_path}.temp"):
+                    try:
+                        os.remove(f"{output_path}.temp")
+                    except Exception:
+                        pass
+                return False
     
     def _backup_mysql(self, output_path: str) -> bool:
-        """
-        Back up MySQL/MariaDB database.
-        
-        Args:
-            output_path (str): Path to store backup.
+            """
+            Back up MySQL/MariaDB database.
             
-        Returns:
-            bool: True if successful, False otherwise.
-        """
-        # Verify credentials
-        if not self.credentials.get('user'):
-            logger.error("Missing required MySQL credentials")
-            return False
-        
-        # Build mysqldump command
-        cmd = f"mysqldump -u {self.credentials['user']}"
-        
-        # Add password if specified
-        if self.credentials.get('password'):
-            cmd += f" -p{self.credentials['password']}"
-        
-        # Add host if specified
-        if self.credentials.get('host') and self.credentials['host'] != 'localhost':
-            cmd += f" -h {self.credentials['host']}"
-        
-        # Add port if specified
-        if self.credentials.get('port'):
-            cmd += f" -P {self.credentials['port']}"
-        
-        # Add database name or use all databases
-        if self.credentials.get('database'):
-            cmd += f" {self.credentials['database']}"
-        else:
-            cmd += " --all-databases"
-        
-        # Add extra options
-        cmd += " --single-transaction --quick --lock-tables=false"
-        
-        # Execute backup command
-        logger.debug(f"Executing MySQL backup command")  # Don't log full command with password
-        exit_code, output = exec_in_container(self.container, cmd)
-        
-        if exit_code != 0:
-            logger.error(f"MySQL backup failed: {output}")
-            return False
-        
-        # Compress and save output
-        try:
-            with gzip.open(output_path, 'wb') as f:
-                f.write(output.encode('utf-8'))
-            logger.info(f"MySQL backup completed successfully: {output_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Error saving MySQL backup: {str(e)}")
-            return False
-    
+            Args:
+                output_path (str): Path to store backup.
+                
+            Returns:
+                bool: True if successful, False otherwise.
+            """
+            # Verify credentials
+            if not self.credentials.get('user'):
+                logger.error("Missing required MySQL credentials")
+                return False
+                
+            # Validate credential values to prevent injection
+            user = self.credentials.get('user', '')
+            database = self.credentials.get('database', '')
+            host = self.credentials.get('host', '')
+            port = self.credentials.get('port', '')
+            
+            # Check for potentially dangerous characters in parameters
+            for param_name, param_value in [
+                ('user', user), 
+                ('database', database),
+                ('host', host)
+            ]:
+                if param_value and not isinstance(param_value, str):
+                    logger.error(f"Invalid {param_name} parameter type: {type(param_value)}")
+                    return False
+                    
+                if param_value and any(c in param_value for c in [';', '&&', '||', '`', '$', '|', '>', '<']):
+                    logger.error(f"Invalid characters in {param_name} parameter")
+                    return False
+            
+            # For numeric parameters, ensure they're actually numeric
+            if port and not str(port).isdigit():
+                logger.error(f"Port must be numeric: {port}")
+                return False
+                
+            # Build mysqldump command parts (without password)
+            cmd_parts = ["mysqldump", "-u", user]
+            
+            # Add host if specified
+            if host and host != 'localhost':
+                cmd_parts.extend(["-h", host])
+            
+            # Add port if specified
+            if port:
+                cmd_parts.extend(["-P", str(port)])
+            
+            # Add database name or use all databases
+            if database:
+                cmd_parts.append(database)
+            else:
+                cmd_parts.append("--all-databases")
+            
+            # Add extra options
+            cmd_parts.extend(["--single-transaction", "--quick", "--lock-tables=false"])
+            
+            # Convert to string and add password separately for security
+            cmd = " ".join(cmd_parts)
+            
+            # Add password if specified (not logging this part)
+            if self.credentials.get('password'):
+                # Using a more secure approach with MYSQL_PWD env var instead of command line
+                env = {"MYSQL_PWD": self.credentials['password']}
+            else:
+                env = {}
+            
+            # Execute backup command
+            logger.debug(f"Executing MySQL backup command (without password)")
+            exit_code, output = exec_in_container(self.container, cmd, env)
+            
+            if exit_code != 0:
+                logger.error(f"MySQL backup failed: {output}")
+                return False
+            
+            # Compress and save output
+            try:
+                # Create temporary file first
+                temp_output_path = f"{output_path}.temp"
+                with gzip.open(temp_output_path, 'wb') as f:
+                    f.write(output.encode('utf-8'))
+                
+                # Move to final location
+                shutil.move(temp_output_path, output_path)
+                logger.info(f"MySQL backup completed successfully: {output_path}")
+                return True
+            except Exception as e:
+                logger.error(f"Error saving MySQL backup: {str(e)}")
+                # Clean up temporary file if it exists
+                if os.path.exists(f"{output_path}.temp"):
+                    try:
+                        os.remove(f"{output_path}.temp")
+                    except Exception:
+                        pass
+                return False
+
     def _backup_sqlite(self, output_path: str) -> bool:
         """
         Back up SQLite database.

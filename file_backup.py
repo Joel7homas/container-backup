@@ -89,117 +89,129 @@ class FileBackup:
                 return False
     
     def _backup_path(self, path: str, temp_dir: str) -> bool:
-        """
-        Back up a single path.
-        
-        Args:
-            path (str): Path to back up.
-            temp_dir (str): Temporary directory to store backup.
+            """
+            Back up a single path.
             
-        Returns:
-            bool: True if successful, False otherwise.
-        """
-        logger.debug(f"Backing up path: {path}")
-        
-        # Handle root directory special case
-        if path in [".", "/"]:
-            # For root directory, use specific paths and exclusions
-            if not self.exclusions:
-                self.exclusions = [
-                    "tmp/*", "proc/*", "sys/*", "dev/*", "run/*", "var/cache/*",
-                    "var/tmp/*", "var/log/*", "var/lib/docker/*"
-                ]
+            Args:
+                path (str): Path to back up.
+                temp_dir (str): Temporary directory to store backup.
+                
+            Returns:
+                bool: True if successful, False otherwise.
+            """
+            logger.debug(f"Backing up path: {path}")
             
-            # Set path to empty string for root
-            path = ""
-        
-        # Normalize path
-        norm_path = path.rstrip("/")
-        
-        # Check if path exists
-        check_cmd = f"[ -e '{norm_path}' ] && echo 'EXISTS' || echo 'NOT_FOUND'"
-        exit_code, output = exec_in_container(self.container, check_cmd)
-        
-        if "NOT_FOUND" in output:
-            logger.warning(f"Path not found in container: {norm_path}")
-            return False
-        
-        # Determine if this is a volume mount
-        mounts = get_container_mounts(self.container)
-        is_volume_mount = False
-        
-        for mount in mounts:
-            container_path = mount.get("destination", "")
-            if container_path and (container_path == norm_path or 
-                                  norm_path.startswith(container_path + "/")):
-                is_volume_mount = True
-                logger.debug(f"Path {norm_path} is a volume mount")
-                break
-        
-        # Back up the path
-        if is_volume_mount:
-            return self._backup_volume_mount(norm_path, temp_dir)
-        else:
-            return self._backup_container_path(norm_path, temp_dir)
+            # Validate path to prevent command injection
+            if not isinstance(path, str):
+                logger.error(f"Invalid path type: {type(path)}")
+                return False
+    
+            # Check for potentially dangerous characters in path
+            if any(c in path for c in [";", "&&", "||", "`", "$", "|"]):
+                logger.error(f"Invalid characters in path: {path}")
+                return False
+    
+            # Handle root directory special case
+            if path in [".", "/"]:
+                # For root directory, use specific paths and exclusions
+                if not self.exclusions:
+                    self.exclusions = [
+                        "tmp/*", "proc/*", "sys/*", "dev/*", "run/*", "var/cache/*",
+                        "var/tmp/*", "var/log/*", "var/lib/docker/*"
+                    ]
+                
+                # Set path to empty string for root
+                path = ""
+            
+            # Normalize path
+            norm_path = path.rstrip("/")
+            
+            # Check if path exists
+            check_cmd = f"[ -e '{norm_path}' ] && echo 'EXISTS' || echo 'NOT_FOUND'"
+            exit_code, output = exec_in_container(self.container, check_cmd)
+            
+            if "NOT_FOUND" in output:
+                logger.warning(f"Path not found in container: {norm_path}")
+                return False
+            
+            # Determine if this is a volume mount
+            mounts = get_container_mounts(self.container)
+            is_volume_mount = False
+            
+            for mount in mounts:
+                container_path = mount.get("destination", "")
+                if container_path and (container_path == norm_path or 
+                                      norm_path.startswith(container_path + "/")):
+                    is_volume_mount = True
+                    logger.debug(f"Path {norm_path} is a volume mount")
+                    break
+            
+            # Back up the path
+            if is_volume_mount:
+                return self._backup_volume_mount(norm_path, temp_dir)
+            else:
+                return self._backup_container_path(norm_path, temp_dir)
     
     def _backup_volume_mount(self, volume: str, output_dir: str) -> bool:
-        """
-        Back up a volume mount.
-        
-        Args:
-            volume (str): Volume path.
-            output_dir (str): Path to store backup.
+            """
+            Back up a volume mount.
             
-        Returns:
-            bool: True if successful, False otherwise.
-        """
-        try:
-            # Create target directory
-            target_dir = os.path.join(output_dir, os.path.basename(volume) or "root")
-            os.makedirs(target_dir, exist_ok=True)
-            
-            # Create tar file in container
-            exclusion_args = self._apply_exclusions(volume)
-            tar_cmd = f"tar -cf /tmp/volume_backup.tar -C '{os.path.dirname(volume) or /}' " \
-                      f"{exclusion_args} '{os.path.basename(volume) or .}'"
-            
-            logger.debug(f"Creating tar file in container: {tar_cmd}")
-            exit_code, output = exec_in_container(self.container, tar_cmd)
-            
-            if exit_code != 0:
-                logger.error(f"Failed to create tar file in container: {output}")
-                return False
-            
-            # Get tar file content from container
-            cat_cmd = "cat /tmp/volume_backup.tar"
-            exit_code, tar_data = exec_in_container(self.container, cat_cmd)
-            
-            if exit_code != 0 or not tar_data:
-                logger.error("Failed to retrieve tar data from container")
+            Args:
+                volume (str): Volume path.
+                output_dir (str): Path to store backup.
+                
+            Returns:
+                bool: True if successful, False otherwise.
+            """
+            try:
+                # Create target directory
+                target_dir = os.path.join(output_dir, os.path.basename(volume) or "root")
+                os.makedirs(target_dir, exist_ok=True)
+                
+                # Create tar file in container
+                exclusion_args = self._apply_exclusions(volume)
+                parent_dir = os.path.dirname(volume) or "/"
+                base_name = os.path.basename(volume) or "."
+                tar_cmd = f"tar -cf /tmp/volume_backup.tar -C '{parent_dir}' " \
+                          f"{exclusion_args} '{base_name}'"
+                
+                logger.debug(f"Creating tar file in container: {tar_cmd}")
+                exit_code, output = exec_in_container(self.container, tar_cmd)
+                
+                if exit_code != 0:
+                    logger.error(f"Failed to create tar file in container: {output}")
+                    return False
+                
+                # Get tar file content from container
+                cat_cmd = "cat /tmp/volume_backup.tar"
+                exit_code, tar_data = exec_in_container(self.container, cat_cmd)
+                
+                if exit_code != 0 or not tar_data:
+                    logger.error("Failed to retrieve tar data from container")
+                    exec_in_container(self.container, "rm -f /tmp/volume_backup.tar")
+                    return False
+                
+                # Write tar data to temporary file
+                temp_tar = os.path.join(output_dir, "temp_volume.tar")
+                with open(temp_tar, 'wb') as f:
+                    f.write(tar_data.encode('utf-8', errors='replace'))
+                
+                # Extract tar file to target directory
+                with tarfile.open(temp_tar, 'r') as tar:
+                    tar.extractall(path=target_dir)
+                
+                # Clean up
+                os.remove(temp_tar)
+                exec_in_container(self.container, "rm -f /tmp/volume_backup.tar")
+                
+                logger.info(f"Successfully backed up volume mount: {volume}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error backing up volume mount {volume}: {str(e)}")
+                # Clean up in container anyway
                 exec_in_container(self.container, "rm -f /tmp/volume_backup.tar")
                 return False
-            
-            # Write tar data to temporary file
-            temp_tar = os.path.join(output_dir, "temp_volume.tar")
-            with open(temp_tar, 'wb') as f:
-                f.write(tar_data.encode('utf-8', errors='replace'))
-            
-            # Extract tar file to target directory
-            with tarfile.open(temp_tar, 'r') as tar:
-                tar.extractall(path=target_dir)
-            
-            # Clean up
-            os.remove(temp_tar)
-            exec_in_container(self.container, "rm -f /tmp/volume_backup.tar")
-            
-            logger.info(f"Successfully backed up volume mount: {volume}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error backing up volume mount {volume}: {str(e)}")
-            # Clean up in container anyway
-            exec_in_container(self.container, "rm -f /tmp/volume_backup.tar")
-            return False
     
     def _backup_container_path(self, path: str, output_dir: str) -> bool:
         """
