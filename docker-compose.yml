@@ -1,21 +1,31 @@
 version: '3.8'
+
 services:
-  database-backup:
-    image: python:3.12-alpine
-    container_name: database-backup
+  container-backup:
+    image: container-backup:latest
+    container_name: container-backup
+    hostname: container-backup
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /path/to/backups:/backups:rw
-      - /path/to/backup-script.py:/app/backup-script.py:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro                             # Read-only access to Docker socket
+      - /mnt/backups:/backups:rw                                                 # Persistent backup storage
+      - /mnt/docker/container-backup/config:/app/config                          # Configuration files
     environment:
-      - TZ=America/Denver
-      - BACKUP_RETENTION_DAYS=7
+      - TZ=${TZ:-America/Denver}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - BACKUP_DIR=/backups
+      - MAX_CONCURRENT_BACKUPS=${MAX_CONCURRENT_BACKUPS:-3}
+      - BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS:-7}
       - PORTAINER_URL=${PORTAINER_URL}
-      - PORTAINER_API_KEY=${PORTAINER_TOKEN}
+      - PORTAINER_API_KEY=${PORTAINER_API_KEY}
+      - PORTAINER_INSECURE=${PORTAINER_INSECURE:-false}
+      - CONFIG_FILE=/app/config/service_configs.json
       - EXCLUDE_FROM_BACKUP=${EXCLUDE_FROM_BACKUP}
       - PYTHONUNBUFFERED=1
-      - CRON_SCHEDULE=01:00  # Run at 1 AM
-    working_dir: /app
-    command: sh -c "pip install docker requests schedule && python3 backup-script.py"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/backups') else 1)"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
