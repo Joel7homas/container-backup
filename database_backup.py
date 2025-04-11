@@ -40,6 +40,61 @@ class DatabaseBackup:
         self.config = config or {}
         
         logger.debug(f"Initialized database backup for {container.name}, type: {self.db_type}")
+
+    def _validate_path(self, path: str) -> bool:
+        """
+        Validate a path to ensure it's safe to use in commands.
+        
+        Args:
+            path (str): Path to validate.
+            
+        Returns:
+            bool: True if path is valid, False otherwise.
+        """
+        if not isinstance(path, str):
+            logger.error(f"Invalid path type: {type(path)}")
+            return False
+        
+        # Check for potentially dangerous characters
+        dangerous_chars = [';', '&&', '||', '`', '$', '|', '>', '<', '*', '?', '[', ']']
+        if any(c in path for c in dangerous_chars):
+            logger.error(f"Path contains dangerous characters: {path}")
+            return False
+        
+        return True
+    
+    def _validate_credential(self, key: str, value: Any) -> bool:
+        """
+        Validate a credential value to prevent injection.
+        
+        Args:
+            key (str): Credential key (user, password, etc.)
+            value (Any): Credential value to validate.
+            
+        Returns:
+            bool: True if value is valid, False otherwise.
+        """
+        if key in ['port']:
+            # Port should be numeric
+            if isinstance(value, int):
+                return 1 <= value <= 65535
+            elif isinstance(value, str) and value.isdigit():
+                port = int(value)
+                return 1 <= port <= 65535
+            return False
+        
+        # String credentials
+        if not isinstance(value, str):
+            logger.error(f"Invalid {key} type: {type(value)}")
+            return False
+        
+        # Check for dangerous shell characters
+        dangerous_chars = [';', '&&', '||', '`', '|', '>', '<']
+        if any(c in value for c in dangerous_chars):
+            logger.error(f"{key} contains dangerous characters")
+            return False
+        
+        return True
     
     def _detect_db_type(self) -> Optional[str]:
         """
@@ -335,7 +390,7 @@ class DatabaseBackup:
 
     def _backup_sqlite(self, output_path: str) -> bool:
         """
-        Back up SQLite database.
+        Back up SQLite database with improved security and error handling.
         
         Args:
             output_path (str): Path to store backup.
@@ -343,92 +398,142 @@ class DatabaseBackup:
         Returns:
             bool: True if successful, False otherwise.
         """
-        # Find SQLite database files
-        cmd = "find / -name '*.sqlite' -o -name '*.db' -o -name '*.sqlite3'"
-        exit_code, output = exec_in_container(self.container, cmd)
-        
-        if exit_code != 0 or not output.strip():
-            logger.error(f"Failed to find SQLite database files: {output}")
-            return False
-        
-        db_files = output.strip().split('\n')
-        
-        # If specific database specified in credentials, filter the list
-        if self.credentials.get('database') and self.credentials['database'] in db_files:
-            db_files = [self.credentials['database']]
-        
-        if not db_files:
-            logger.error("No SQLite database files found")
-            return False
-        
-        # Use the first database file found if multiple
-        db_file = db_files[0]
-        if len(db_files) > 1:
-            logger.warning(f"Multiple SQLite databases found, using: {db_file}")
-        
-        # Create a temporary copy to ensure consistent backup
-        temp_file = "/tmp/sqlite_backup_temp.db"
+        # Create temporary directory for consistent backups
+        temp_dir = None
+        temp_files = []
         
         try:
+            temp_dir = tempfile.mkdtemp(prefix="sqlite_backup_")
+            
+            # Find SQLite database files
+            cmd = "find / -name '*.sqlite' -o -name '*.db' -o -name '*.sqlite3' 2>/dev/null"
+            exit_code, output = exec_in_container(self.container, cmd)
+            
+            if exit_code != 0:
+                logger.error(f"Failed to find SQLite database files: {output}")
+                return False
+            
+            db_files = [file for file in output.strip().split('\n') if file.strip()]
+            
+            # If specific database specified in credentials, filter the list
+            if self.credentials.get('database') and isinstance(self.credentials['database'], str):
+                db_path = self.credentials['database']
+                # Validate database path
+                if not self._validate_path(db_path):
+                    logger.error(f"Invalid database path: {db_path}")
+                    return False
+                    
+                # Check if path exists in the list
+                matching_files = [f for f in db_files if f == db_path]
+                if matching_files:
+                    db_files = matching_files
+                else:
+                    logger.warning(f"Specified database not found: {db_path}, using discovered databases")
+            
+            if not db_files:
+                logger.error("No SQLite database files found")
+                return False
+            
+            # Use the first database file found if multiple
+            db_file = db_files[0]
+            if len(db_files) > 1:
+                logger.warning(f"Multiple SQLite databases found, using: {db_file}")
+            
+            # Validate database path
+            if not self._validate_path(db_file):
+                logger.error(f"Invalid database path: {db_file}")
+                return False
+            
+            # Use consistent paths in container
+            container_temp = "/tmp/sqlite_backup"
+            container_backup_db = f"{container_temp}/backup.db"
+            container_tar = f"{container_temp}/sqlite_backup.tar"
+            
+            # Create temporary directory in container
+            mkdir_cmd = f"mkdir -p {container_temp}"
+            exit_code, _ = exec_in_container(self.container, mkdir_cmd)
+            if exit_code != 0:
+                logger.error(f"Failed to create temporary directory in container")
+                return False
+            
+            # Record for cleanup
+            temp_files.extend([container_backup_db, container_tar, container_temp])
+            
             # Create a backup using SQLite's backup mechanism
-            backup_cmd = f"sqlite3 '{db_file}' '.backup '{temp_file}''"
+            # Ensure path is properly escaped and quoted for security
+            backup_cmd = f"sqlite3 '{db_file.replace(\"'\", \"'\\''\")}' '.backup \"{container_backup_db}\"'"
             exit_code, output = exec_in_container(self.container, backup_cmd)
             
             if exit_code != 0:
                 logger.error(f"SQLite backup command failed: {output}")
                 return False
             
-            # Get the temporary file from the container
-            logger.debug(f"Copying SQLite database from container")
-            
-            # Create a tar archive of the file in the container
-            tar_cmd = f"tar -cf /tmp/sqlite_backup.tar -C /tmp sqlite_backup_temp.db"
+            # Create a tar archive in container
+            tar_cmd = f"tar -cf {container_tar} -C $(dirname {container_backup_db}) $(basename {container_backup_db})"
             exit_code, _ = exec_in_container(self.container, tar_cmd)
             
             if exit_code != 0:
                 logger.error("Failed to create tar archive in container")
                 return False
             
-            # Get raw data from the container
-            cat_cmd = "cat /tmp/sqlite_backup.tar"
+            # Get tar data from container
+            cat_cmd = f"cat {container_tar}"
             exit_code, tar_data = exec_in_container(self.container, cat_cmd)
             
             if exit_code != 0 or not tar_data:
                 logger.error("Failed to retrieve tar data from container")
                 return False
             
-            # Write tar file locally
-            temp_tar = f"{output_path}.tar"
-            with open(temp_tar, 'wb') as f:
+            # Write tar data to local temporary file
+            local_temp_tar = os.path.join(temp_dir, "sqlite_backup.tar")
+            with open(local_temp_tar, 'wb') as f:
                 f.write(tar_data.encode('utf-8', errors='replace'))
             
             # Extract SQLite file from tar
-            import tarfile
-            with tarfile.open(temp_tar, 'r') as tar:
-                sqlite_content = tar.extractfile('sqlite_backup_temp.db').read()
+            try:
+                with tarfile.open(local_temp_tar, 'r') as tar:
+                    sqlite_content = tar.extractfile(os.path.basename(container_backup_db)).read()
+            except Exception as e:
+                logger.error(f"Failed to extract SQLite database from archive: {str(e)}")
+                return False
             
-            # Compress and save the SQLite file
-            with gzip.open(output_path, 'wb') as f:
+            # Write to temporary output file first
+            temp_output_path = f"{output_path}.tmp"
+            with gzip.open(temp_output_path, 'wb') as f:
                 f.write(sqlite_content)
             
-            # Clean up temporary file
-            os.remove(temp_tar)
-            
-            # Clean up in container
-            exec_in_container(self.container, "rm -f /tmp/sqlite_backup.tar /tmp/sqlite_backup_temp.db")
+            # Atomically move to final location
+            shutil.move(temp_output_path, output_path)
             
             logger.info(f"SQLite backup completed successfully: {output_path}")
             return True
             
         except Exception as e:
             logger.error(f"Error during SQLite backup: {str(e)}")
-            # Attempt to clean up in container anyway
-            exec_in_container(self.container, "rm -f /tmp/sqlite_backup.tar /tmp/sqlite_backup_temp.db")
+            # Attempt to cleanup temporary output file
+            if 'temp_output_path' in locals() and os.path.exists(temp_output_path):
+                try:
+                    os.remove(temp_output_path)
+                except Exception:
+                    pass
             return False
+            
+        finally:
+            # Clean up in container
+            if temp_files:
+                cleanup_cmd = f"rm -rf {' '.join(temp_files)}"
+                exec_in_container(self.container, cleanup_cmd)
+            
+            # Clean up local temporary directory
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temporary directory: {str(e)}")
     
     def _backup_mongodb(self, output_path: str) -> bool:
         """
-        Back up MongoDB database.
+        Back up MongoDB database with improved security and error handling.
         
         Args:
             output_path (str): Path to store backup.
@@ -436,78 +541,132 @@ class DatabaseBackup:
         Returns:
             bool: True if successful, False otherwise.
         """
-        # Create temporary directory in container
-        temp_dir = "/tmp/mongodb_backup"
-        exec_in_container(self.container, f"mkdir -p {temp_dir}")
-        
-        # Build mongodump command
-        cmd = "mongodump --out=" + temp_dir
-        
-        # Add authentication if provided
-        if self.credentials.get('user') and self.credentials.get('password'):
-            cmd += f" --username={self.credentials['user']} --password={self.credentials['password']}"
-            
-            # Add authentication database if provided
-            if self.credentials.get('authSource'):
-                cmd += f" --authenticationDatabase={self.credentials['authSource']}"
-        
-        # Add host and port if specified
-        if self.credentials.get('host') and self.credentials['host'] != 'localhost':
-            cmd += f" --host={self.credentials['host']}"
-        
-        if self.credentials.get('port'):
-            cmd += f" --port={self.credentials['port']}"
-        
-        # Add database name if specified
-        if self.credentials.get('database'):
-            cmd += f" --db={self.credentials['database']}"
-        
-        # Execute backup command
-        logger.debug(f"Executing MongoDB backup command")  # Don't log full command with password
-        exit_code, output = exec_in_container(self.container, cmd)
-        
-        if exit_code != 0:
-            logger.error(f"MongoDB backup failed: {output}")
-            exec_in_container(self.container, f"rm -rf {temp_dir}")
-            return False
+        # Create temporary directory for consistent backups
+        temp_dir = None
+        temp_files = []
         
         try:
+            temp_dir = tempfile.mkdtemp(prefix="mongodb_backup_")
+            
+            # Define consistent paths in container
+            container_temp = "/tmp/mongodb_backup"
+            container_tar = "/tmp/mongodb_backup.tar"
+            
+            # Create temporary directory in container
+            mkdir_cmd = f"mkdir -p {container_temp}"
+            exit_code, _ = exec_in_container(self.container, mkdir_cmd)
+            
+            if exit_code != 0:
+                logger.error(f"Failed to create temporary directory in container")
+                return False
+            
+            # Record for cleanup
+            temp_files.extend([container_temp, container_tar])
+            
+            # Validate credentials
+            credentials = {}
+            for key in ['user', 'password', 'host', 'port', 'database', 'authSource']:
+                if key in self.credentials and self.credentials[key]:
+                    # Validate to prevent injection
+                    if not self._validate_credential(key, self.credentials[key]):
+                        logger.error(f"Invalid {key} parameter in MongoDB credentials")
+                        return False
+                    credentials[key] = self.credentials[key]
+            
+            # Build mongodump command arguments securely
+            cmd_parts = ["mongodump", f"--out={container_temp}"]
+            
+            # Add authentication if provided
+            if credentials.get('user') and credentials.get('password'):
+                cmd_parts.append(f"--username={credentials['user']}")
+                # Password will be passed via environment variable
+            
+            # Add authentication database if provided
+            if credentials.get('authSource'):
+                cmd_parts.append(f"--authenticationDatabase={credentials['authSource']}")
+            
+            # Add host and port if specified
+            if credentials.get('host') and credentials['host'] != 'localhost':
+                cmd_parts.append(f"--host={credentials['host']}")
+            
+            if credentials.get('port'):
+                cmd_parts.append(f"--port={credentials['port']}")
+            
+            # Add database name if specified
+            if credentials.get('database'):
+                cmd_parts.append(f"--db={credentials['database']}")
+            
+            # Join command parts into a secure command string
+            cmd = " ".join(cmd_parts)
+            
+            # Set up environment variables for sensitive data
+            env = {}
+            if credentials.get('password'):
+                env["MONGO_PASSWORD"] = credentials['password']
+                # Modified command to use environment variable
+                cmd = cmd.replace("--username=", "MONGO_PASSWORD=\"$MONGO_PASSWORD\" --username=")
+            
+            # Execute backup command
+            logger.debug(f"Executing MongoDB backup command (without password)")
+            exit_code, output = exec_in_container(self.container, cmd, env)
+            
+            if exit_code != 0:
+                logger.error(f"MongoDB backup failed: {output}")
+                return False
+            
             # Create tar archive in container
-            tar_cmd = f"tar -cf /tmp/mongodb_backup.tar -C /tmp mongodb_backup"
+            tar_cmd = f"tar -cf {container_tar} -C /tmp mongodb_backup"
             exit_code, _ = exec_in_container(self.container, tar_cmd)
             
             if exit_code != 0:
-                logger.error("Failed to create MongoDB backup archive")
-                exec_in_container(self.container, f"rm -rf {temp_dir} /tmp/mongodb_backup.tar")
+                logger.error(f"Failed to create MongoDB backup archive")
                 return False
             
             # Get tar data from container
-            cat_cmd = "cat /tmp/mongodb_backup.tar"
+            cat_cmd = f"cat {container_tar}"
             exit_code, tar_data = exec_in_container(self.container, cat_cmd)
             
             if exit_code != 0 or not tar_data:
-                logger.error("Failed to retrieve MongoDB backup data")
-                exec_in_container(self.container, f"rm -rf {temp_dir} /tmp/mongodb_backup.tar")
+                logger.error(f"Failed to retrieve MongoDB backup data")
                 return False
             
-            # Compress and save output
-            with gzip.open(output_path, 'wb') as f:
+            # Write to temporary output file first
+            temp_output_path = f"{output_path}.tmp"
+            with gzip.open(temp_output_path, 'wb') as f:
                 f.write(tar_data.encode('utf-8', errors='replace'))
             
-            # Clean up in container
-            exec_in_container(self.container, f"rm -rf {temp_dir} /tmp/mongodb_backup.tar")
+            # Atomically move to final location
+            shutil.move(temp_output_path, output_path)
             
             logger.info(f"MongoDB backup completed successfully: {output_path}")
             return True
             
         except Exception as e:
-            logger.error(f"Error saving MongoDB backup: {str(e)}")
-            exec_in_container(self.container, f"rm -rf {temp_dir} /tmp/mongodb_backup.tar")
+            logger.error(f"Error during MongoDB backup: {str(e)}")
+            # Attempt to cleanup temporary output file
+            if 'temp_output_path' in locals() and os.path.exists(temp_output_path):
+                try:
+                    os.remove(temp_output_path)
+                except Exception:
+                    pass
             return False
+            
+        finally:
+            # Clean up in container
+            if temp_files:
+                cleanup_cmd = f"rm -rf {' '.join(temp_files)}"
+                exec_in_container(self.container, cleanup_cmd)
+            
+            # Clean up local temporary directory
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temporary directory: {str(e)}")
     
     def _backup_redis(self, output_path: str) -> bool:
         """
-        Back up Redis database.
+        Back up Redis database with improved security and error handling.
         
         Args:
             output_path (str): Path to store backup.
@@ -515,96 +674,142 @@ class DatabaseBackup:
         Returns:
             bool: True if successful, False otherwise.
         """
-        # Determine backup approach based on Redis configuration
-        # First, try RDB file if available
-        rdb_path = "/data/dump.rdb"
-        check_cmd = f"ls {rdb_path} 2>/dev/null || echo 'NOT_FOUND'"
-        exit_code, check_output = exec_in_container(self.container, check_cmd)
+        # Create temporary directory for consistent backups
+        temp_dir = None
+        temp_files = []
         
-        if exit_code == 0 and "NOT_FOUND" not in check_output:
-            # RDB file exists, copy it
-            try:
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="redis_backup_")
+            
+            # Define consistent paths in container
+            container_rdb = "/tmp/redis_backup.rdb"
+            container_tar = "/tmp/redis_backup.tar"
+            
+            # Record for cleanup
+            temp_files.extend([container_rdb, container_tar])
+            
+            # Validate credentials
+            credentials = {}
+            for key in ['password', 'host', 'port']:
+                if key in self.credentials and self.credentials[key]:
+                    # Validate to prevent injection
+                    if not self._validate_credential(key, self.credentials[key]):
+                        logger.error(f"Invalid {key} parameter in Redis credentials")
+                        return False
+                    credentials[key] = self.credentials[key]
+            
+            # Determine backup approach based on Redis configuration
+            # First, check if RDB file is available
+            rdb_path = "/data/dump.rdb"
+            check_cmd = f"ls {rdb_path} 2>/dev/null || echo 'NOT_FOUND'"
+            exit_code, check_output = exec_in_container(self.container, check_cmd)
+            
+            # Flag to track if we're using RDB file or redis-cli
+            using_rdb_file = False
+            
+            if exit_code == 0 and "NOT_FOUND" not in check_output:
+                # RDB file exists, use it for backup
+                logger.info("Using existing RDB file for Redis backup")
+                using_rdb_file = True
+                
+                # Validate RDB path
+                if not self._validate_path(rdb_path):
+                    logger.error(f"Invalid RDB path: {rdb_path}")
+                    return False
+                
                 # Create tar archive of RDB file
-                tar_cmd = f"tar -cf /tmp/redis_backup.tar {rdb_path}"
+                tar_cmd = f"tar -cf {container_tar} {rdb_path}"
                 exit_code, _ = exec_in_container(self.container, tar_cmd)
                 
                 if exit_code != 0:
                     logger.error("Failed to create Redis RDB backup archive")
-                    return False
-                
-                # Get tar data from container
-                cat_cmd = "cat /tmp/redis_backup.tar"
-                exit_code, tar_data = exec_in_container(self.container, cat_cmd)
-                
-                if exit_code != 0 or not tar_data:
-                    logger.error("Failed to retrieve Redis RDB backup data")
-                    exec_in_container(self.container, "rm -f /tmp/redis_backup.tar")
-                    return False
-                
-                # Compress and save output
-                with gzip.open(output_path, 'wb') as f:
-                    f.write(tar_data.encode('utf-8', errors='replace'))
-                
-                # Clean up in container
-                exec_in_container(self.container, "rm -f /tmp/redis_backup.tar")
-                
-                logger.info(f"Redis RDB backup completed successfully: {output_path}")
-                return True
-                
-            except Exception as e:
-                logger.error(f"Error saving Redis RDB backup: {str(e)}")
-                exec_in_container(self.container, "rm -f /tmp/redis_backup.tar")
-                return False
-        
-        # If RDB not available or failed, try using redis-cli
-        logger.info("RDB file not available, using redis-cli for backup")
-        
-        # Build redis-cli command
-        cmd = "redis-cli --rdb /tmp/redis_backup.rdb"
-        
-        # Add authentication if provided
-        if self.credentials.get('password'):
-            cmd += f" -a {self.credentials['password']}"
-        
-        # Add host and port if specified
-        if self.credentials.get('host') and self.credentials['host'] != 'localhost':
-            cmd += f" -h {self.credentials['host']}"
-        
-        if self.credentials.get('port'):
-            cmd += f" -p {self.credentials['port']}"
-        
-        # Execute backup command
-        logger.debug(f"Executing Redis backup command")  # Don't log full command with password
-        exit_code, output = exec_in_container(self.container, cmd)
-        
-        if exit_code != 0:
-            logger.error(f"Redis backup failed: {output}")
-            return False
-        
-        try:
-            # Get the RDB file from the container
-            cat_cmd = "cat /tmp/redis_backup.rdb"
-            exit_code, rdb_data = exec_in_container(self.container, cat_cmd)
+                    # Fall back to redis-cli approach
+                    using_rdb_file = False
             
-            if exit_code != 0 or not rdb_data:
+            # If RDB not available or tar failed, use redis-cli
+            if not using_rdb_file:
+                logger.info("Using redis-cli for backup")
+                
+                # Build redis-cli command securely
+                cmd_parts = ["redis-cli", f"--rdb {container_rdb}"]
+                
+                # Add authentication if provided
+                # Password will be provided via environment variable
+                
+                # Add host and port if specified
+                if credentials.get('host') and credentials['host'] != 'localhost':
+                    cmd_parts.append(f"-h {credentials['host']}")
+                
+                if credentials.get('port'):
+                    cmd_parts.append(f"-p {credentials['port']}")
+                
+                # Join command parts into a secure command string
+                cmd = " ".join(cmd_parts)
+                
+                # Set up environment variables for sensitive data
+                env = {}
+                if credentials.get('password'):
+                    env["REDIS_PASSWORD"] = credentials['password']
+                    # Modified command to use environment variable
+                    cmd = f"REDISCLI_AUTH=\"$REDIS_PASSWORD\" {cmd}"
+                
+                # Execute backup command
+                logger.debug(f"Executing Redis backup command (without password)")
+                exit_code, output = exec_in_container(self.container, cmd, env)
+                
+                if exit_code != 0:
+                    logger.error(f"Redis backup failed: {output}")
+                    return False
+                
+                # Create tar archive of the generated RDB file
+                tar_cmd = f"tar -cf {container_tar} {container_rdb}"
+                exit_code, _ = exec_in_container(self.container, tar_cmd)
+                
+                if exit_code != 0:
+                    logger.error("Failed to create Redis backup archive")
+                    return False
+            
+            # Get tar data from container
+            cat_cmd = f"cat {container_tar}"
+            exit_code, tar_data = exec_in_container(self.container, cat_cmd)
+            
+            if exit_code != 0 or not tar_data:
                 logger.error("Failed to retrieve Redis backup data")
-                exec_in_container(self.container, "rm -f /tmp/redis_backup.rdb")
                 return False
             
-            # Compress and save output
-            with gzip.open(output_path, 'wb') as f:
-                f.write(rdb_data.encode('utf-8', errors='replace'))
+            # Write to temporary output file first
+            temp_output_path = f"{output_path}.tmp"
+            with gzip.open(temp_output_path, 'wb') as f:
+                f.write(tar_data.encode('utf-8', errors='replace'))
             
-            # Clean up in container
-            exec_in_container(self.container, "rm -f /tmp/redis_backup.rdb")
+            # Atomically move to final location
+            shutil.move(temp_output_path, output_path)
             
             logger.info(f"Redis backup completed successfully: {output_path}")
             return True
             
         except Exception as e:
-            logger.error(f"Error saving Redis backup: {str(e)}")
-            exec_in_container(self.container, "rm -f /tmp/redis_backup.rdb")
+            logger.error(f"Error during Redis backup: {str(e)}")
+            # Attempt to cleanup temporary output file
+            if 'temp_output_path' in locals() and os.path.exists(temp_output_path):
+                try:
+                    os.remove(temp_output_path)
+                except Exception:
+                    pass
             return False
+            
+        finally:
+            # Clean up in container
+            if temp_files:
+                cleanup_cmd = f"rm -rf {' '.join(temp_files)}"
+                exec_in_container(self.container, cleanup_cmd)
+            
+            # Clean up local temporary directory
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temporary directory: {str(e)}")
     
     def get_credentials_from_environment(self, env_vars: Dict[str, str], 
                                        stack_name: Optional[str] = None) -> Dict[str, str]:
