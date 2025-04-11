@@ -6,6 +6,7 @@ Service discovery module for the service-oriented Docker backup system.
 Discovers and categorizes Docker services for backup.
 """
 
+import os
 from typing import Dict, List, Any, Optional
 from logger import get_logger
 from service_backup import ServiceBackup
