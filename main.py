@@ -40,7 +40,7 @@ def initialize_components() -> Tuple[PortainerClient, ConfigurationManager, Back
     Set up all system components.
     
     Returns:
-        tuple: Tuple of initialized components (portainer_client, config_manager, backup_manager).
+        tuple: Tuple of initialized components.
     """
     global logger
     
@@ -57,9 +57,50 @@ def initialize_components() -> Tuple[PortainerClient, ConfigurationManager, Back
     if missing_vars:
         logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         sys.exit(1)
-
-    if not validate_docker_environment():
-        logger.warning("Docker environment validation raised warnings")
+    
+    # Get backup directory from environment or use default
+    backup_dir = os.environ.get('BACKUP_DIR', '/backups')
+    locks_dir = os.path.join(backup_dir, 'locks')
+    
+    # Check directory permissions
+    directories = {
+        backup_dir: {'read', 'write', 'execute'},
+        locks_dir: {'read', 'write', 'execute'}
+    }
+    
+    # Add config directory if specified
+    config_path = os.environ.get('CONFIG_FILE')
+    if config_path:
+        config_dir = os.path.dirname(config_path)
+        directories[config_dir] = {'read', 'write', 'execute'}
+    
+    # Check permissions
+    permission_check_passed = check_directory_permissions(directories)
+    if not permission_check_passed:
+        logger.warning("Permission checks failed, some operations may not work correctly")
+        
+        # Try to create directories with proper permissions
+        try:
+            os.makedirs(backup_dir, exist_ok=True)
+            os.makedirs(locks_dir, exist_ok=True)
+            logger.info(f"Created backup directories: {backup_dir}, {locks_dir}")
+        except PermissionError as e:
+            logger.error(f"Failed to create backup directories: {str(e)}")
+            logger.error("Make sure the application has proper permissions or adjust BACKUP_DIR")
+            logger.error("Continuing with reduced functionality")
+    
+    # Log runtime identity
+    try:
+        import pwd
+        user_info = pwd.getpwuid(os.getuid())
+        username = user_info.pw_name
+        uid = user_info.pw_uid
+        gid = os.getgid()
+        logger.info(f"Running as user: {username} (UID:{uid}, GID:{gid})")
+    except ImportError:
+        logger.debug("Could not import pwd module for user identification")
+    except Exception as e:
+        logger.warning(f"Error identifying runtime user: {str(e)}")
     
     # Initialize portainer client
     portainer_client = PortainerClient(
@@ -68,9 +109,7 @@ def initialize_components() -> Tuple[PortainerClient, ConfigurationManager, Back
     )
     
     # Initialize configuration manager
-    config_path = os.environ.get('CONFIG_FILE', '/app/config/service_configs.json')
-    config_manager = ConfigurationManager(config_path=config_path)
-
+    config_manager = ConfigurationManager()
     
     if config_path:
         try:
@@ -84,6 +123,14 @@ def initialize_components() -> Tuple[PortainerClient, ConfigurationManager, Back
     
     # Initialize backup manager
     backup_manager = BackupManager(portainer_client, config_manager)
+    
+    # Check for stale locks
+    try:
+        stale_locks = backup_manager._check_stale_locks()
+        if stale_locks > 0:
+            logger.info(f"Cleaned up {stale_locks} stale lock files")
+    except Exception as e:
+        logger.warning(f"Error checking for stale locks: {str(e)}")
     
     logger.info("System initialization complete")
     return portainer_client, config_manager, backup_manager
@@ -152,6 +199,92 @@ def parse_args() -> argparse.Namespace:
         
     return args
 
+def check_directory_permissions(directories: Dict[str, Set[str]]) -> bool:
+    """
+    Check that the current user has required permissions for critical directories.
+    
+    Args:
+        directories (dict): Dictionary of path to required permissions
+                          (e.g., {'read', 'write', 'execute'})
+    
+    Returns:
+        bool: True if all permissions are correct, False otherwise
+    """
+    all_permissions_ok = True
+    
+    for path_str, required_perms in directories.items():
+        path = Path(path_str)
+        
+        # Skip checks if the path doesn't exist and we need write permission
+        # (we'll create it later)
+        if not path.exists() and 'write' in required_perms:
+            parent = path.parent
+            if not parent.exists():
+                logger.warning(f"Parent directory of {path} doesn't exist")
+                all_permissions_ok = False
+                continue
+                
+            # Check if we can write to the parent directory
+            if os.access(parent, os.W_OK):
+                logger.debug(f"Directory {path} doesn't exist but can be created")
+                continue
+            else:
+                logger.error(f"Cannot create directory {path}: permission denied on parent")
+                all_permissions_ok = False
+                continue
+        
+        # Check permissions
+        perms_ok = True
+        
+        if 'read' in required_perms and not os.access(path, os.R_OK):
+            logger.error(f"Read permission denied: {path}")
+            perms_ok = False
+        
+        if 'write' in required_perms and not os.access(path, os.W_OK):
+            logger.error(f"Write permission denied: {path}")
+            perms_ok = False
+        
+        if 'execute' in required_perms and not os.access(path, os.X_OK):
+            # For directories, execute permission is needed to list contents
+            if path.is_dir():
+                logger.error(f"Execute permission denied on directory: {path}")
+                perms_ok = False
+        
+        if not perms_ok:
+            all_permissions_ok = False
+            
+            # Get ownership information
+            try:
+                import pwd
+                import grp
+                stat_info = os.stat(path)
+                uid = stat_info.st_uid
+                gid = stat_info.st_gid
+                user = pwd.getpwuid(uid).pw_name
+                group = grp.getgrgid(gid).gr_name
+                
+                current_uid = os.getuid()
+                current_user = pwd.getpwuid(current_uid).pw_name
+                
+                logger.error(f"Permissions issue on {path}:")
+                logger.error(f"  Owned by: {user}:{group} (UID:{uid}, GID:{gid})")
+                logger.error(f"  Current user: {current_user} (UID:{current_uid})")
+                
+                # Get file permissions
+                mode = stat_info.st_mode
+                perms = ''
+                for who in ['USR', 'GRP', 'OTH']:
+                    for what in ['R', 'W', 'X']:
+                        if mode & getattr(stat, f'S_I{what}{who}'):
+                            perms += what.lower()
+                        else:
+                            perms += '-'
+                logger.error(f"  Permissions: {perms}")
+                
+            except ImportError:
+                logger.error("Could not import pwd/grp modules for detailed permission info")
+    
+    return all_permissions_ok
 
 def setup_scheduling(backup_manager: BackupManager, interval: str, 
                     retention_interval: str) -> None:
