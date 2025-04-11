@@ -6,9 +6,9 @@ services:
     container_name: container-backup
     hostname: container-backup
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro                             # Read-only access to Docker socket
-      - /mnt/backups:/backups:rw                                                 # Persistent backup storage
-      - /mnt/docker/container-backup/config:/app/config                          # Configuration files
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # Read-only access to Docker socket
+      - /mnt/backups:/backups:rw                     # Persistent backup storage
+      - /mnt/docker/container-backup/config:/app/config  # Configuration files
     environment:
       - TZ=${TZ:-America/Denver}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
@@ -21,6 +21,11 @@ services:
       - CONFIG_FILE=/app/config/service_configs.json
       - EXCLUDE_FROM_BACKUP=${EXCLUDE_FROM_BACKUP}
       - PYTHONUNBUFFERED=1
+      # User/Group configuration
+      - PUID=34          # UID for the backup user
+      - PGID=80920       # GID for the backup group
+      # Optional: Override detected Docker socket GID
+      #- DOCKER_GID=988  # Uncomment and set if Docker socket GID detection fails
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/backups') else 1)"]
@@ -28,4 +33,35 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+# Alternative configuration with Docker Socket Proxy for enhanced security
+# (Uncomment to use instead of direct socket mounting)
+#
+# services:
+#   docker-socket-proxy:
+#     image: tecnativa/docker-socket-proxy:latest
+#     volumes:
+#       - /var/run/docker.sock:/var/run/docker.sock:ro
+#     environment:
+#       CONTAINERS: 1  # Allow container listing/inspection
+#       IMAGES: 1      # Allow image operations needed for backups
+#       NETWORKS: 1    # Allow network information access
+#       SERVICES: 0    # No need for Swarm services
+#       VOLUMES: 1     # Allow volume information
+#       EXEC: 1        # Allow exec commands for database backups
+#       TASKS: 0       # Disable Swarm task access
+#       VERSION: 1     # Allow version checking
+#     restart: unless-stopped
+#
+#   container-backup:
+#     # ... other settings stay the same ...
+#     environment:
+#       # ... other environment variables ...
+#       - DOCKER_HOST=tcp://docker-socket-proxy:2375  # Connect to proxy instead
+#     volumes:
+#       # Socket mount is not needed with proxy
+#       - /mnt/backups:/backups:rw
+#       - /mnt/docker/container-backup/config:/app/config
+#     depends_on:
+#       - docker-socket-proxy
 
