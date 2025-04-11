@@ -403,6 +403,7 @@ class DatabaseBackup:
         temp_files = []
         
         try:
+            import tempfile
             temp_dir = tempfile.mkdtemp(prefix="sqlite_backup_")
             
             # Find SQLite database files
@@ -461,7 +462,7 @@ class DatabaseBackup:
             
             # Create a backup using SQLite's backup mechanism
             # Ensure path is properly escaped and quoted for security
-            backup_cmd = f"sqlite3 '{db_file.replace(\"'\", \"'\\''\")}' '.backup \"{container_backup_db}\"'"
+            backup_cmd = f"sqlite3 '{db_file.replace(\"'\", \"''\")}' '.backup \"{container_backup_db}\"'"
             exit_code, output = exec_in_container(self.container, backup_cmd)
             
             if exit_code != 0:
@@ -491,6 +492,7 @@ class DatabaseBackup:
             
             # Extract SQLite file from tar
             try:
+                import tarfile
                 with tarfile.open(local_temp_tar, 'r') as tar:
                     sqlite_content = tar.extractfile(os.path.basename(container_backup_db)).read()
             except Exception as e:
