@@ -1,6 +1,6 @@
 FROM python:3.12-alpine
 
-ARG VERSION=1.0.11-alpha
+ARG VERSION=1.0.12-alpha
 ARG UID=80920
 ARG GID=80920
 
@@ -22,6 +22,7 @@ RUN apk update && \
     su-exec \
     curl \
     tzdata \
+    docker-cli \
     shadow
 
 # Create non-root user

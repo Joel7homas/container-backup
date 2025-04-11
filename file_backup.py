@@ -8,9 +8,10 @@ Manages application file backup operations.
 
 import os
 import time
-import tempfile
-import tarfile
 import shutil
+import tarfile
+import fnmatch
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union, Tuple, Set
 
@@ -159,7 +160,7 @@ class FileBackup:
     
     def _backup_path_from_stopped_container(self, path: str, temp_dir: str) -> bool:
         """
-        Back up a path from a stopped container using docker cp.
+        Back up a path from a stopped container using the Docker API instead of docker cp.
         
         Args:
             path (str): Path to back up.
@@ -168,65 +169,56 @@ class FileBackup:
         Returns:
             bool: True if successful, False otherwise.
         """
-        logger.info(f"Backing up path from stopped container {self.container.name} using docker cp: {path}")
+        logger.info(f"Backing up path from stopped container {self.container.name} using Docker API: {path}")
         
         try:
+            import io
+            import tarfile
+            
             # Create a target directory based on the path name
             target_dir = os.path.join(temp_dir, os.path.basename(path) or "root")
             os.makedirs(target_dir, exist_ok=True)
             
-            # Use docker cp to copy data directly (without executing commands in the container)
-            import subprocess
-            
-            # Construct the docker cp command
+            # Get the container
             container_id = self.container.id
             container_path = path or "/"  # Use root if path is empty
             
-            # When path is /, we need special handling since docker cp behaves differently
-            if container_path == "/":
-                # Create a list of directories to exclude
-                exclude_dirs = ['proc', 'sys', 'dev', 'tmp', 'run', 'var/cache', 'var/tmp', 'var/log']
-                exclude_args = ' '.join([f'--exclude=/{d}' for d in exclude_dirs])
+            # Get archive from container using Docker API
+            try:
+                logger.debug(f"Getting archive from container {self.container.name} path: {container_path}")
+                bits, stat = self.container.get_archive(container_path)
                 
-                # Use tar to create an archive of the root directory with exclusions
-                cmd = f"docker cp {container_id}:/ - | tar {exclude_args} -xf - -C {target_dir}"
-            else:
-                # Handle exclusion patterns for specific paths
-                if self.exclusions and path:
-                    # Create a temporary tar file
-                    temp_tar = os.path.join(temp_dir, "temp_backup.tar")
-                    
-                    # First copy to a tar file
-                    cp_cmd = f"docker cp {container_id}:{container_path} - > {temp_tar}"
-                    cp_result = subprocess.run(cp_cmd, shell=True, capture_output=True, text=True)
-                    
-                    if cp_result.returncode != 0:
-                        logger.error(f"Failed to docker cp from stopped container: {cp_result.stderr}")
-                        return False
-                    
-                    # Then extract with exclusions
-                    exclusion_args = ' '.join([f'--exclude="{excl}"' for excl in self.exclusions])
-                    extract_cmd = f"tar -xf {temp_tar} {exclusion_args} -C {target_dir}"
-                    extract_result = subprocess.run(extract_cmd, shell=True, capture_output=True, text=True)
-                    
-                    if extract_result.returncode != 0:
-                        logger.error(f"Failed to extract with exclusions: {extract_result.stderr}")
-                        return False
-                    
-                    # Clean up temp file
-                    os.remove(temp_tar)
-                else:
-                    # Simple case - direct copy with no exclusions
-                    cmd = f"docker cp {container_id}:{container_path} {target_dir}"
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                    
-                    if result.returncode != 0:
-                        logger.error(f"Failed to docker cp from stopped container: {result.stderr}")
-                        return False
-            
-            logger.info(f"Successfully backed up path {path} from stopped container {self.container.name}")
-            return True
-            
+                # Create a file-like object from the generator
+                fileobj = io.BytesIO()
+                for chunk in bits:
+                    fileobj.write(chunk)
+                fileobj.seek(0)
+                
+                # Extract the tar data
+                with tarfile.open(fileobj=fileobj, mode='r') as tar:
+                    # Apply exclusion filters if needed
+                    if self.exclusions:
+                        logger.debug(f"Applying exclusions to archive: {', '.join(self.exclusions)}")
+                        for member in tar.getmembers():
+                            skip = False
+                            for pattern in self.exclusions:
+                                if fnmatch.fnmatch(member.name, pattern):
+                                    skip = True
+                                    break
+                            
+                            if not skip:
+                                tar.extract(member, path=target_dir)
+                    else:
+                        # Extract everything
+                        tar.extractall(path=target_dir)
+                
+                logger.info(f"Successfully backed up path {path} from stopped container {self.container.name}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to get archive from container: {str(e)}")
+                return False
+                
         except Exception as e:
             logger.error(f"Error backing up path {path} from stopped container {self.container.name}: {str(e)}")
             return False
@@ -461,3 +453,4 @@ class FileBackup:
         ]
         
         return any(path == sys_dir or path.startswith(sys_dir + "/") for sys_dir in system_dirs)
+
