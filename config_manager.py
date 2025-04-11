@@ -27,24 +27,30 @@ logger = get_logger(__name__)
 class ConfigurationManager:
     """Manages service configurations with defaults and overrides."""
     
-    def __init__(self, custom_configs: Optional[Dict[str, Any]] = None):
+    def __init__(self, custom_configs: Optional[Dict[str, Any]] = None, config_path: Optional[str] = None):
         """
         Initialize configuration manager.
         
         Args:
             custom_configs (dict, optional): Custom configurations to override defaults.
+            config_path (str, optional): Path to configuration file. If not provided, 
+                                        will use CONFIG_FILE environment variable.
         """
         self.custom_configs = custom_configs or {}
         self.builtin_configs = self._load_builtin_configs()
         self.env_configs = {}
         self.file_configs = {}
         
-        # Load configurations from environment and files
+        # Load configurations from environment
         self.env_configs = self.load_configs_from_env()
+        
+        # Initialize default configuration if needed
+        self.initialize_configuration(config_path)
         
         # Log configuration sources
         logger.info(f"Loaded {len(self.builtin_configs)} built-in service configurations")
         logger.info(f"Loaded {len(self.env_configs)} service configurations from environment")
+        logger.info(f"Loaded {len(self.file_configs)} service configurations from file")
         logger.info(f"Loaded {len(self.custom_configs)} custom service configurations")
     
     def _load_builtin_configs(self) -> Dict[str, Any]:
@@ -102,6 +108,87 @@ class ConfigurationManager:
         
         return configs
     
+    def initialize_configuration(self, config_path: Optional[str] = None) -> None:
+        """
+        Initialize configuration files if they don't exist.
+        Creates default configs in the expected locations.
+        
+        Args:
+            config_path (str, optional): Path to the config directory or file.
+                If not provided, will use the CONFIG_FILE environment variable.
+        """
+        # Determine config path - either from parameter or environment variable
+        if not config_path:
+            config_path = os.environ.get('CONFIG_FILE')
+        
+        if not config_path:
+            logger.warning("No configuration path specified, skipping initialization")
+            return
+        
+        config_path = Path(config_path)
+        
+        # If it's a directory, use a default filename
+        if config_path.is_dir():
+            config_path = config_path / "service_configs.json"
+        
+        # Check if config already exists
+        if config_path.exists():
+            logger.debug(f"Configuration file already exists at {config_path}")
+            try:
+                # Load existing configuration
+                self.load_configs_from_file(str(config_path))
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load existing configuration: {str(e)}")
+        
+        # Create directory if it doesn't exist
+        os.makedirs(config_path.parent, exist_ok=True)
+        
+        # Create default configuration
+        try:
+            default_configs = {
+                "wordpress": self.builtin_configs.get("wordpress", {}),
+                "nextcloud": self.builtin_configs.get("nextcloud", {}),
+                "homeassistant": self.builtin_configs.get("homeassistant", {})
+            }
+            
+            # Add example configuration
+            default_configs["example_service"] = {
+                "database": {
+                    "type": "postgres",
+                    "requires_stopping": False,
+                    "container_patterns": ["*postgres*", "*db*"]
+                },
+                "files": {
+                    "data_paths": ["/app/data", "/app/config"],
+                    "requires_stopping": False,
+                    "exclusions": ["*/cache/*", "*/tmp/*", "*.log"]
+                },
+                "global": {
+                    "backup_retention": 14,
+                    "exclude_from_backup": False,
+                    "priority": 30
+                }
+            }
+            
+            # Write to file in appropriate format
+            if config_path.suffix.lower() in ['.yaml', '.yml'] and YAML_AVAILABLE:
+                with open(config_path, 'w') as f:
+                    yaml.dump(default_configs, f, default_flow_style=False, sort_keys=False)
+            else:
+                # Default to JSON if YAML not available or not specified
+                with open(config_path, 'w') as f:
+                    json.dump(default_configs, f, indent=2)
+            
+            logger.info(f"Created default configuration file at {config_path}")
+            
+            # Load the created configuration
+            self.load_configs_from_file(str(config_path))
+            
+        except Exception as e:
+            logger.error(f"Failed to create default configuration file: {str(e)}")
+
+
     def _get_default_config(self) -> Dict[str, Any]:
         """
         Get default configuration for services.

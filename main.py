@@ -22,6 +22,7 @@ from logger import configure_logging, get_logger
 from config_manager import ConfigurationManager
 from portainer_client import PortainerClient
 from backup_manager import BackupManager
+from utils.docker_utils import validate_docker_environment
 
 try:
     import schedule
@@ -56,6 +57,9 @@ def initialize_components() -> Tuple[PortainerClient, ConfigurationManager, Back
     if missing_vars:
         logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         sys.exit(1)
+
+    if not validate_docker_environment():
+        logger.warning("Docker environment validation raised warnings")
     
     # Initialize portainer client
     portainer_client = PortainerClient(
@@ -64,8 +68,9 @@ def initialize_components() -> Tuple[PortainerClient, ConfigurationManager, Back
     )
     
     # Initialize configuration manager
-    config_path = os.environ.get('CONFIG_FILE')
-    config_manager = ConfigurationManager()
+    config_path = os.environ.get('CONFIG_FILE', '/app/config/service_configs.json')
+    config_manager = ConfigurationManager(config_path=config_path)
+
     
     if config_path:
         try:
@@ -246,7 +251,7 @@ def main() -> None:
         # Set up signal handlers
         signal.signal(signal.SIGINT, lambda sig, frame: handle_signal(sig, frame))
         signal.signal(signal.SIGTERM, lambda sig, frame: handle_signal(sig, frame))
-        
+
         # Execute command with standardized error handling
         if args.command == 'backup':
             try:

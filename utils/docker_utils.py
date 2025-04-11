@@ -36,6 +36,66 @@ ALLOWED_OPERATIONS = {
     'volumes': {'list'}
 }
 
+def validate_docker_environment() -> bool:
+    """
+    Validate the Docker environment and permissions.
+    Checks socket permissions and warns about potential security issues.
+    
+    Returns:
+        bool: True if environment is valid, False otherwise.
+    """
+    if not DOCKER_AVAILABLE:
+        logger.error("Docker SDK for Python not installed. Install with: pip install docker")
+        return False
+    
+    # Check if Docker socket is accessible
+    try:
+        client = docker.from_env()
+        client.ping()
+    except DockerException as e:
+        logger.error(f"Cannot connect to Docker daemon: {str(e)}")
+        
+        # Check if this is a permission issue
+        if "permission denied" in str(e).lower():
+            logger.error("Permission denied accessing Docker socket. This could be due to:")
+            logger.error("  1. The user running this application is not in the 'docker' group")
+            logger.error("  2. The Docker socket is not accessible to the current user")
+            logger.error("  3. The container does not have the Docker socket properly mounted")
+            logger.error("\nPossible solutions:")
+            logger.error("  - Add the user to the 'docker' group: sudo usermod -aG docker $USER")
+            logger.error("  - Restart the container with proper socket mounting")
+            logger.error("  - Use a Docker socket proxy for improved security")
+        
+        return False
+    
+    # Check if we're running in a container and with proper security
+    if os.path.exists('/.dockerenv'):
+        logger.info("Running inside a Docker container")
+        
+        # Check if Docker socket is mounted with potentially unsafe permissions
+        docker_socket_path = '/var/run/docker.sock'
+        if os.path.exists(docker_socket_path):
+            socket_stat = os.stat(docker_socket_path)
+            
+            # Check if socket has wide permissions
+            if socket_stat.st_mode & 0o002:  # world-writable
+                logger.warning("Docker socket has world-writable permissions - this is a security risk")
+            
+            # Check if socket is mounted directly
+            logger.warning("Docker socket is mounted directly into the container. For improved security:")
+            logger.warning("  1. Consider using a Docker socket proxy (tecnativa/docker-socket-proxy)")
+            logger.warning("  2. Mount the socket as read-only: docker.sock:/var/run/docker.sock:ro")
+            logger.warning("  3. Enable DOCKER_READ_ONLY=true in environment variables")
+    
+    # Log that we're using read-only mode for security
+    read_only = os.environ.get('DOCKER_READ_ONLY', 'true').lower() in ('true', '1', 'yes')
+    if read_only:
+        logger.info("Docker read-only mode is enabled for improved security")
+    else:
+        logger.warning("Docker read-only mode is disabled - this reduces security")
+        logger.warning("Set DOCKER_READ_ONLY=true for improved security")
+    
+    return True
 
 def get_docker_client() -> Optional['docker.DockerClient']:
     """
