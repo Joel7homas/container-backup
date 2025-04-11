@@ -1,6 +1,6 @@
 FROM python:3.12-alpine
 
-ARG VERSION=1.0.3-alpha
+ARG VERSION=1.0.5-alpha
 ARG UID=80920
 ARG GID=80920
 
@@ -26,8 +26,8 @@ RUN apk update && \
     shadow
 
 # Create non-root user
-RUN addgroup -g 80920 appuser && \
-    adduser -D -u 80920 -G appuser -s /bin/bash appuser
+RUN addgroup -g ${GID} appuser && \
+    adduser -D -u ${UID} -G appuser -s /bin/bash appuser
 
 # Create backup directory with proper permissions
 RUN mkdir -p /backups && \
@@ -61,8 +61,10 @@ RUN chown -R appuser:appuser /app
 RUN echo '#!/bin/bash' > /entrypoint.sh && \
     echo 'if [ ! -z "$PUID" ] && [ ! -z "$PGID" ]; then' >> /entrypoint.sh && \
     echo '  echo "Changing user/group IDs at runtime to $PUID:$PGID"' >> /entrypoint.sh && \
-    echo '  groupmod -g $PGID appuser' >> /entrypoint.sh && \
-    echo '  usermod -u $PUID appuser' >> /entrypoint.sh && \
+    echo '  deluser appuser' >> /entrypoint.sh && \
+    echo '  delgroup appuser' >> /entrypoint.sh && \
+    echo '  addgroup -g $PGID appuser' >> /entrypoint.sh && \
+    echo '  adduser -D -u $PUID -G appuser -s /bin/sh appuser' >> /entrypoint.sh && \
     echo '  chown -R appuser:appuser /app /backups' >> /entrypoint.sh && \
     echo 'fi' >> /entrypoint.sh && \
     echo 'exec su-exec appuser "$@"' >> /entrypoint.sh && \
