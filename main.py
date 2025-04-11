@@ -199,7 +199,7 @@ def parse_args() -> argparse.Namespace:
         
     return args
 
-def check_directory_permissions(directories: Dict[str, Set[str]]) -> bool:
+def check_directory_permissions(directories: Dict[str, set[str]]) -> bool:
     """
     Check that the current user has required permissions for critical directories.
     
