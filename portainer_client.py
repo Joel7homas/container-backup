@@ -35,8 +35,6 @@ class PortainerClient:
         """
         self.url = url.rstrip('/')
         self.api_key = api_key
-        self.session = self._create_session()
-        self.verify_ssl = not os.environ.get('PORTAINER_INSECURE', '').lower() in ('true', '1', 'yes')
         
         # Get timeouts from environment variables or use defaults
         self.connect_timeout = int(os.environ.get('PORTAINER_CONNECT_TIMEOUT', '5'))
@@ -44,8 +42,12 @@ class PortainerClient:
         self.retry_total = int(os.environ.get('PORTAINER_RETRY_TOTAL', '3'))
         self.retry_backoff = float(os.environ.get('PORTAINER_RETRY_BACKOFF', '0.5'))
         
+        self.verify_ssl = not os.environ.get('PORTAINER_INSECURE', '').lower() in ('true', '1', 'yes')
         if not self.verify_ssl:
             logger.warning("SSL verification is disabled for Portainer API requests")
+        
+        # Initialize session after all member variables are set
+        self.session = self._create_session()
         
         logger.info(f"Initialized Portainer client for {self.url} "
                    f"(connect_timeout={self.connect_timeout}s, read_timeout={self.read_timeout}s, "
