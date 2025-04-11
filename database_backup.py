@@ -462,7 +462,8 @@ class DatabaseBackup:
             
             # Create a backup using SQLite's backup mechanism
             # Ensure path is properly escaped and quoted for security
-            backup_cmd = f"sqlite3 '{db_file.replace(\"'\", \"''\")}' '.backup \"{container_backup_db}\"'"
+            #backup_cmd = f"sqlite3 '{db_file.replace(\"'\", \"''\")}' '.backup \"{container_backup_db}\"'"
+            backup_cmd = f"""sqlite3 '{db_file.replace("'", "''")}' '.backup "{container_backup_db}"'"""
             exit_code, output = exec_in_container(self.container, backup_cmd)
             
             if exit_code != 0:
