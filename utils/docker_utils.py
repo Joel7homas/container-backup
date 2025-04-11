@@ -453,14 +453,13 @@ def get_running_containers() -> List[Any]:
         logger.error(f"Error getting running containers: {str(e)}")
         return []
 
-
 def exec_in_container(container: Any, command: str, env: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
     """
-    Execute a command in a container.
-    Performs validation and sanitization to reduce security risks.
+    Execute a command in a container with robust error handling.
+    Performs validation, status checks, and handles synchronization issues.
     
     Args:
-        container (Container): Container object.
+        container (Container): Docker container object.
         command (str): Command to execute.
         env (dict, optional): Environment variables for the command.
         
@@ -481,32 +480,85 @@ def exec_in_container(container: Any, command: str, env: Optional[Dict[str, str]
         # Default environment variables
         env = env or {}
         
-        # Sanitize command to prevent injection
-        # We're just executing the command as-is, but in a real security context,
-        # further validation might be needed here depending on the use case
+        # First try to refresh container information
+        try:
+            container.reload()
+        except Exception as reload_err:
+            logger.warning(f"Error refreshing container {container.name}: {str(reload_err)}")
+            # Continue anyway, as the container might still be usable
         
-        logger.debug(f"Executing in {container.name}: {command}")
+        # Check if container is running
+        if hasattr(container, 'status') and container.status != 'running':
+            logger.warning(f"Container {container.name} is not running (status: {container.status})")
+            
+            # Try alternatives - 1. Direct CLI check as a fallback
+            try:
+                import subprocess
+                result = subprocess.run(
+                    f"docker ps -q --filter id={container.id} --filter status=running",
+                    shell=True, capture_output=True, text=True
+                )
+                if result.stdout.strip():
+                    logger.info(f"Container {container.name} appears to be running according to CLI check")
+                    # Container is running according to CLI, proceed with caution
+                else:
+                    # Both SDK and CLI agree the container is not running
+                    return (-1, f"Container is not running (status: {container.status})")
+            except Exception as cli_err:
+                logger.warning(f"Error during CLI container check: {str(cli_err)}")
+                # Failed CLI check, rely on SDK status
+                return (-1, f"Container is not running (status: {container.status})")
         
-        # Set an execution timeout to prevent hanging
-        timeout = int(os.environ.get('DOCKER_EXEC_TIMEOUT', '300'))  # 5 minutes default
-        
-        result = container.exec_run(
-            cmd=command,
-            environment=env,
-            detach=False,
-            tty=False,
-            demux=False
-        )
-        
-        exit_code = result.exit_code
-        output = result.output.decode('utf-8', errors='replace')
-        
-        if exit_code != 0:
-            logger.warning(f"Command in {container.name} exited with code {exit_code}: {output}")
-        
-        return exit_code, output
+        # Try to execute the command with additional error context
+        try:
+            logger.debug(f"Executing in {container.name} (ID: {container.id[:12]}): {command}")
+            
+            # Set an execution timeout to prevent hanging
+            timeout = int(os.environ.get('DOCKER_EXEC_TIMEOUT', '300'))  # 5 minutes default
+            
+            result = container.exec_run(
+                cmd=command,
+                environment=env,
+                detach=False,
+                tty=False,
+                demux=False
+            )
+            
+            exit_code = result.exit_code
+            output = result.output.decode('utf-8', errors='replace')
+            
+            if exit_code != 0:
+                logger.warning(f"Command in {container.name} exited with code {exit_code}: {output}")
+            
+            return exit_code, output
+            
+        except docker.errors.APIError as api_err:
+            error_msg = str(api_err).lower()
+            
+            # Check for specific error conditions
+            if "is not running" in error_msg or "is paused" in error_msg:
+                # Container state changed between our check and the exec
+                logger.warning(f"Container state changed: {container.name} - {api_err}")
+                
+                # Try to reload the container to update its status
+                try:
+                    container.reload()
+                    logger.info(f"Container status after reload: {container.status}")
+                except Exception as reload_err:
+                    logger.error(f"Error reloading container: {str(reload_err)}")
+                
+                return (-1, f"Container state changed: {api_err}")
+                
+            elif "no such container" in error_msg:
+                logger.warning(f"Container was removed: {container.name}")
+                return (-1, "Container no longer exists")
+                
+            else:
+                logger.error(f"Docker API error: {api_err}")
+                return (-1, f"Docker API error: {api_err}")
         
     except Exception as e:
         container_name = getattr(container, 'name', 'unknown')
-        logger.error(f"Error executing command in {container_name}: {str(e)}")
+        container_id = getattr(container, 'id', 'unknown')
+        logger.error(f"Error executing command in {container_name} ({container_id}): {str(e)}")
         return -1, str(e)
