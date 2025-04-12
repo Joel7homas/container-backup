@@ -36,6 +36,7 @@ ALLOWED_OPERATIONS = {
     'volumes': {'list'}
 }
 
+
 def validate_docker_environment() -> bool:
     """
     Validate the Docker environment and permissions.
@@ -562,3 +563,238 @@ def exec_in_container(container: Any, command: str, env: Optional[Dict[str, str]
         container_id = getattr(container, 'id', 'unknown')
         logger.error(f"Error executing command in {container_name} ({container_id}): {str(e)}")
         return -1, str(e)
+
+def validate_docker_environment() -> bool:
+    """
+    Validate the Docker environment and permissions.
+    Checks socket permissions and warns about potential security issues.
+    
+    Returns:
+        bool: True if environment is valid, False otherwise.
+    """
+    if not DOCKER_AVAILABLE:
+        logger.error("Docker SDK for Python not installed. Install with: pip install docker")
+        return False
+    
+    # Check if Docker socket is accessible
+    try:
+        client = docker.from_env()
+        client.ping()
+    except DockerException as e:
+        logger.error(f"Cannot connect to Docker daemon: {str(e)}")
+        
+        # Check if this is a permission issue
+        if "permission denied" in str(e).lower():
+            logger.error("Permission denied accessing Docker socket. This could be due to:")
+            logger.error("  1. The user running this application is not in the 'docker' group")
+            logger.error("  2. The Docker socket is not accessible to the current user")
+            logger.error("  3. The container does not have the Docker socket properly mounted")
+            logger.error("\nPossible solutions:")
+            logger.error("  - Add the user to the 'docker' group: sudo usermod -aG docker $USER")
+            logger.error("  - Restart the container with proper socket mounting")
+            logger.error("  - Use a Docker socket proxy for improved security")
+        
+        return False
+    
+    # Check if we're running in a container and with proper security
+    if os.path.exists('/.dockerenv'):
+        logger.info("Running inside a Docker container")
+        
+        # Check if Docker socket is mounted with potentially unsafe permissions
+        docker_socket_path = '/var/run/docker.sock'
+        if os.path.exists(docker_socket_path):
+            socket_stat = os.stat(docker_socket_path)
+            
+            # Check if socket has wide permissions
+            if socket_stat.st_mode & 0o002:  # world-writable
+                logger.warning("Docker socket has world-writable permissions - this is a security risk")
+            
+            # Check if socket is mounted directly
+            logger.warning("Docker socket is mounted directly into the container. For improved security:")
+            logger.warning("  1. Consider using a Docker socket proxy (tecnativa/docker-socket-proxy)")
+            logger.warning("  2. Mount the socket as read-only: docker.sock:/var/run/docker.sock:ro")
+            logger.warning("  3. Enable DOCKER_READ_ONLY=true in environment variables")
+    
+    # Log that we're using read-only mode for security
+    read_only = os.environ.get('DOCKER_READ_ONLY', 'true').lower() in ('true', '1', 'yes')
+    if read_only:
+        logger.info("Docker read-only mode is enabled for improved security")
+    else:
+        logger.warning("Docker read-only mode is disabled - this reduces security")
+        logger.warning("Set DOCKER_READ_ONLY=true for improved security")
+    
+    return True
+
+def get_docker_client() -> Optional['docker.DockerClient']:
+    """
+    Get a Docker client instance with retries on failure.
+    Uses read-only access where possible to reduce privilege escalation risks.
+    
+    Returns:
+        docker.DockerClient or None: Docker client instance or None if failed.
+    """
+    if not DOCKER_AVAILABLE:
+        logger.error("Docker SDK for Python not installed. Install with: pip install docker")
+        return None
+    
+    # Check for read-only mode configuration
+    read_only = os.environ.get('DOCKER_READ_ONLY', 'true').lower() in ('true', '1', 'yes')
+    if read_only:
+        logger.info("Using read-only Docker client for improved security")
+    
+    max_retries = 3
+    retry_delay = 2  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            # Use environment variables (DOCKER_HOST, etc.) if available
+            client = docker.from_env()
+            
+            # Test connection
+            client.ping()
+            logger.debug("Successfully connected to Docker daemon")
+            
+            # If in read-only mode, wrap the client with security checks
+            if read_only:
+                return ReadOnlyDockerClient(client)
+            return client
+            
+        except DockerException as e:
+            logger.warning(f"Docker connection attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+            
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger.error("Failed to connect to Docker daemon after multiple attempts")
+                return None
+
+class ReadOnlyDockerClient:
+    """
+    Wrapper around Docker client that restricts operations to read-only
+    to reduce privilege escalation risks.
+    """
+    
+    def __init__(self, client: 'docker.DockerClient'):
+        """
+        Initialize with a Docker client.
+        
+        Args:
+            client: Docker client to wrap
+        """
+        self._client = client
+        self._allowed_ops = ALLOWED_OPERATIONS
+        logger.debug("Initialized read-only Docker client wrapper")
+        
+        # Initialize restricted access to collection attributes
+        self.containers = RestrictedCollection(client.containers, 'containers', self._allowed_ops)
+        self.images = RestrictedCollection(client.images, 'images', self._allowed_ops)
+        self.networks = RestrictedCollection(client.networks, 'networks', self._allowed_ops)
+        self.volumes = RestrictedCollection(client.volumes, 'volumes', self._allowed_ops)
+    
+    def ping(self) -> bool:
+        """Ping the Docker daemon to verify connection."""
+        return self._client.ping()
+
+
+class RestrictedCollection:
+    """Wrapper for Docker collections that restricts operations."""
+    
+    def __init__(self, collection: Any, collection_name: str, allowed_ops: Dict[str, Set[str]]):
+        """
+        Initialize with a Docker collection.
+        
+        Args:
+            collection: Docker collection to wrap
+            collection_name: Name of the collection (containers, images, etc.)
+            allowed_ops: Dictionary of allowed operations
+        """
+        self._collection = collection
+        self._collection_name = collection_name
+        self._allowed_ops = allowed_ops
+        
+    def __getattr__(self, name: str) -> Any:
+        """
+        Get attribute from the collection, checking against allowed operations.
+        
+        Args:
+            name: Attribute name
+            
+        Returns:
+            Attribute value
+            
+        Raises:
+            PermissionError: If operation is not allowed
+        """
+        if self._collection_name in self._allowed_ops and name in self._allowed_ops[self._collection_name]:
+            return getattr(self._collection, name)
+        else:
+            operation = f"{self._collection_name}.{name}"
+            logger.warning(f"Blocked potentially dangerous Docker operation: {operation}")
+            raise PermissionError(f"Operation not allowed: {operation}")
+
+def _is_valid_container_id(container_id: str) -> bool:
+    """
+    Validate container ID format to prevent injection attacks.
+    
+    Args:
+        container_id: Container ID or name to validate
+        
+    Returns:
+        bool: True if valid, False otherwise
+    """
+    # Docker IDs are 64-character hex strings
+    # Container names can be alphanumeric with some special chars
+    return bool(re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,63}$', container_id) or 
+                re.match(r'^[a-f0-9]{12,64}$', container_id))
+
+
+def _is_valid_container(container: Any) -> bool:
+    """
+    Validate a container object.
+    
+    Args:
+        container: Container object to validate
+        
+    Returns:
+        bool: True if valid, False otherwise
+    """
+    if not container:
+        return False
+    
+    # Check for basic container attributes
+    required_attrs = ['id', 'name', 'attrs']
+    return all(hasattr(container, attr) for attr in required_attrs)
+
+def is_container_running(container: Any) -> bool:
+    """
+    Check if a container is running with robust error handling.
+    
+    Args:
+        container: Container object to check
+        
+    Returns:
+        bool: True if running, False otherwise
+    """
+    if not _is_valid_container(container):
+        return False
+    
+    try:
+        # Try to reload container to get current state
+        container.reload()
+        return container.status == 'running'
+    except Exception as e:
+        logger.debug(f"Error checking container status via API: {str(e)}")
+        
+        # Fallback to direct CLI check if API fails
+        try:
+            import subprocess
+            result = subprocess.run(
+                f"docker ps -q --filter id={container.id} --filter status=running",
+                shell=True, capture_output=True, text=True
+            )
+            return bool(result.stdout.strip())
+        except Exception as cli_err:
+            logger.debug(f"Error checking container via CLI: {str(cli_err)}")
+            return False

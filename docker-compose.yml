@@ -20,6 +20,7 @@ services:
       - PORTAINER_INSECURE=${PORTAINER_INSECURE:-false}
       - CONFIG_FILE=/app/config/service_configs.json
       - EXCLUDE_FROM_BACKUP=${EXCLUDE_FROM_BACKUP}
+      - BACKUP_SERVICE_NAMES=container-backup,backup
       - PYTHONUNBUFFERED=1
       # User/Group configuration
       - PUID=34          # UID for the backup user

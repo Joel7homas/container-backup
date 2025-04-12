@@ -90,6 +90,11 @@ class BackupManager:
         
         logger.info(f"Found {len(services)} services to back up")
         
+        # Filter out backup service itself
+        backup_service_names = os.environ.get('BACKUP_SERVICE_NAMES', 'container-backup,backup').split(',')
+        backup_service_names = [name.strip() for name in backup_service_names]
+        services = [s for s in services if s.service_name not in backup_service_names]
+        
         # Sort services by priority
         services.sort(key=lambda s: s.config.get('global', {}).get('priority', 50))
         
@@ -255,6 +260,11 @@ class BackupManager:
             return False
         
         try:
+            # Skip backing up the backup service itself
+            if self._is_backup_service(service_name):
+                logger.info(f"Skipping backup of the backup service itself: {service_name}")
+                return True
+            
             # Run backup
             success = service.backup()
             return success
@@ -264,6 +274,31 @@ class BackupManager:
         finally:
             # Always remove lock file
             self._remove_lock(lock_path)
+    
+    def _is_backup_service(self, service_name: str) -> bool:
+        """
+        Check if a service is the backup service itself.
+        
+        Args:
+            service_name (str): Service name to check.
+            
+        Returns:
+            bool: True if this is the backup service, False otherwise.
+        """
+        # Check environment variable for backup service name
+        backup_service_names = os.environ.get('BACKUP_SERVICE_NAMES', 'container-backup,backup')
+        backup_names = [name.strip() for name in backup_service_names.split(',')]
+        
+        # Check current hostname
+        try:
+            import socket
+            current_hostname = socket.gethostname()
+            if current_hostname == service_name:
+                return True
+        except Exception:
+            pass
+        
+        return service_name in backup_names
     
     def apply_retention_policy(self) -> int:
         """

@@ -174,6 +174,7 @@ class ServiceBackup:
     def _stop_containers(self) -> List[Any]:
         """
         Stop containers for consistent backup.
+        Avoids stopping the backup container itself.
         
         Returns:
             list: List of stopped container objects.
@@ -182,8 +183,21 @@ class ServiceBackup:
         stopped_containers = []
         
         try:
+            # Get the current container's name to avoid stopping ourselves
+            current_container_name = None
+            try:
+                import socket
+                current_container_name = socket.gethostname()
+                logger.debug(f"Current container name: {current_container_name}")
+            except Exception as e:
+                logger.debug(f"Could not determine current container name: {str(e)}")
+            
             # Stop containers in reverse order (dependencies first)
             for container in reversed(self.containers):
+                if current_container_name and container.name == current_container_name:
+                    logger.info(f"Skipping current container: {container.name}")
+                    continue
+                    
                 if container.status == "running":
                     logger.debug(f"Stopping container: {container.name}")
                     container.stop(timeout=30)  # Give containers 30 seconds to stop

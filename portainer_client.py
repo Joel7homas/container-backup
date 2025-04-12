@@ -164,7 +164,7 @@ class PortainerClient:
                     }
                 
                 return result
-            
+                
             except requests.exceptions.ConnectTimeout as e:
                 logger.warning(f"Connection timeout on {endpoint}: {str(e)}")
                 if manual_attempt < manual_retries:
@@ -174,7 +174,7 @@ class PortainerClient:
                 else:
                     logger.error(f"Failed to connect to {endpoint} after {manual_retries+1} attempts")
                     return None
-            
+                
             except requests.exceptions.ReadTimeout as e:
                 logger.warning(f"Read timeout on {endpoint}: {str(e)}")
                 if manual_attempt < manual_retries:
@@ -184,7 +184,7 @@ class PortainerClient:
                 else:
                     logger.error(f"Request to {endpoint} timed out after {manual_retries+1} attempts")
                     return None
-            
+                
             except requests.exceptions.RequestException as e:
                 # Other request errors will be handled by the retry adapter
                 logger.warning(f"Request to {endpoint} failed: {str(e)}")
@@ -195,7 +195,7 @@ class PortainerClient:
                 else:
                     logger.error(f"Failed to make request to {endpoint} after multiple attempts")
                     return None
-            
+                
             except ValueError as e:
                 logger.error(f"JSON parsing error for {endpoint}: {str(e)}")
                 return None
