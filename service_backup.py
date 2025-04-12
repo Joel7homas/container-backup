@@ -175,6 +175,7 @@ class ServiceBackup:
         """
         Stop containers for consistent backup.
         Avoids stopping the backup container itself.
+        Improves container identification with multiple methods.
         
         Returns:
             list: List of stopped container objects.
@@ -183,32 +184,52 @@ class ServiceBackup:
         stopped_containers = []
         
         try:
-            # Get the current container's name to avoid stopping ourselves
-            current_container_name = None
-            try:
-                import socket
-                current_container_name = socket.gethostname()
-                logger.debug(f"Current container name: {current_container_name}")
-            except Exception as e:
-                logger.debug(f"Could not determine current container name: {str(e)}")
+            # Get the current container's identifiers
+            current_identifiers = self._get_current_container_identifiers()
+            logger.debug(f"Current container identifiers: {current_identifiers}")
+            
+            # Identify critical infrastructure containers that should not be stopped
+            critical_patterns = ['flann', 'registry', 'network', 'proxy']
+            critical_containers = []
+            
+            for container in self.containers:
+                is_critical = False
+                if hasattr(container, 'name'):
+                    container_name = container.name.lower()
+                    for pattern in critical_patterns:
+                        if pattern in container_name:
+                            logger.info(f"Container {container.name} identified as critical infrastructure, will not stop")
+                            is_critical = True
+                            break
+                
+                if is_critical:
+                    critical_containers.append(container)
             
             # Stop containers in reverse order (dependencies first)
             for container in reversed(self.containers):
-                if current_container_name and container.name == current_container_name:
+                # Skip current container
+                if self._is_current_container(container, current_identifiers):
                     logger.info(f"Skipping current container: {container.name}")
                     continue
                     
-                if container.status == "running":
+                # Skip critical containers
+                if container in critical_containers:
+                    continue
+                    
+                if hasattr(container, 'status') and container.status == "running":
                     logger.debug(f"Stopping container: {container.name}")
-                    container.stop(timeout=30)  # Give containers 30 seconds to stop
-                    stopped_containers.append(container)
+                    try:
+                        container.stop(timeout=30)  # Give containers 30 seconds to stop
+                        stopped_containers.append(container)
+                    except Exception as e:
+                        logger.error(f"Error stopping container {container.name}: {str(e)}")
             
             # Short delay to ensure containers are fully stopped
             if stopped_containers:
                 time.sleep(2)
             
             return stopped_containers
-            
+                
         except Exception as e:
             logger.error(f"Error stopping containers: {str(e)}")
             # Try to restart any containers that were stopped
@@ -217,7 +238,7 @@ class ServiceBackup:
     
     def _start_containers(self, containers: List[Any]) -> None:
         """
-        Start containers after backup.
+        Start containers after backup with validation and health checking.
         
         Args:
             containers (list): List of container objects to start.
@@ -227,14 +248,129 @@ class ServiceBackup:
         
         logger.info(f"Starting containers for service {self.service_name}")
         
+        # Create a list to track successfully started containers
+        started_containers = []
+        failed_containers = []
+        
         # Start containers in original order
         for container in containers:
             try:
+                if not hasattr(container, 'name'):
+                    logger.warning(f"Container object missing name attribute, skipping")
+                    continue
+                    
                 logger.debug(f"Starting container: {container.name}")
                 container.start()
+                
+                # Verify container started successfully
+                start_time = time.time()
+                max_wait = 30  # Maximum seconds to wait for container to start
+                
+                while time.time() - start_time < max_wait:
+                    # Refresh container status
+                    try:
+                        container.reload()
+                        if container.status == "running":
+                            started_containers.append(container)
+                            logger.debug(f"Container {container.name} started successfully")
+                            break
+                    except Exception as e:
+                        logger.warning(f"Error checking container status: {str(e)}")
+                    
+                    # Wait a bit before checking again
+                    time.sleep(1)
+                
+                # If container didn't start within timeout
+                if container not in started_containers:
+                    logger.error(f"Container {container.name} failed to start within {max_wait} seconds")
+                    failed_containers.append(container)
+                    
             except Exception as e:
                 logger.error(f"Error starting container {container.name}: {str(e)}")
-    
+                failed_containers.append(container)
+        
+        # Log summary
+        if started_containers:
+            logger.info(f"Successfully started {len(started_containers)} containers")
+        
+        if failed_containers:
+            logger.error(f"Failed to start {len(failed_containers)} containers: " + 
+                        ", ".join(c.name for c in failed_containers if hasattr(c, 'name')))
+
+    def _get_current_container_identifiers(self) -> Dict[str, str]:
+        """
+        Get identifiers for the current container.
+        
+        Returns:
+            dict: Dictionary with hostname, container ID, and name.
+        """
+        identifiers = {}
+        
+        # Get hostname
+        try:
+            import socket
+            identifiers['hostname'] = socket.gethostname()
+        except Exception as e:
+            logger.debug(f"Could not determine hostname: {str(e)}")
+        
+        # Get container ID
+        try:
+            with open('/proc/self/cgroup', 'r') as f:
+                for line in f:
+                    if 'docker' in line:
+                        identifiers['container_id'] = line.split('/')[-1].strip()
+                        break
+        except Exception as e:
+            logger.debug(f"Could not determine container ID: {str(e)}")
+        
+        # Get environment variables that might indicate container name
+        try:
+            identifiers['container_name'] = os.environ.get('HOSTNAME', '')
+        except Exception:
+            pass
+            
+        return identifiers
+
+    def _is_current_container(self, container: Any, current_identifiers: Dict[str, str]) -> bool:
+        """
+        Check if a container is the current container.
+        
+        Args:
+            container: Container object to check.
+            current_identifiers: Dictionary of current container identifiers.
+            
+        Returns:
+            bool: True if this is the current container, False otherwise.
+        """
+        # If container is missing required attributes, assume it's not the current container
+        if not hasattr(container, 'id') or not hasattr(container, 'name'):
+            return False
+        
+        # Check by container ID (most reliable)
+        if 'container_id' in current_identifiers and current_identifiers['container_id']:
+            if container.id == current_identifiers['container_id']:
+                return True
+        
+        # Check by hostname
+        if 'hostname' in current_identifiers and current_identifiers['hostname']:
+            if container.name == current_identifiers['hostname']:
+                return True
+            
+        # Check by environment variable name
+        if 'container_name' in current_identifiers and current_identifiers['container_name']:
+            if container.name == current_identifiers['container_name']:
+                return True
+        
+        # Check by service name
+        backup_service_names = os.environ.get('BACKUP_SERVICE_NAMES', 'container-backup,backup')
+        backup_names = [name.strip() for name in backup_service_names.split(',')]
+        
+        for name in backup_names:
+            if container.name == name or container.name.startswith(f"{name}_"):
+                return True
+        
+        return False
+
     def _backup_databases(self, backup_dir: str) -> bool:
         """
         Back up all databases in service.

@@ -142,10 +142,20 @@ class ServiceDiscovery:
         """
         # Check environment variable for excluded services
         exclude_env = os.environ.get('EXCLUDE_FROM_BACKUP', '')
-        excluded_services = [s.strip() for s in exclude_env.split(',') if s.strip()]
+        
+        # Split by comma and strip whitespace
+        excluded_services = []
+        if exclude_env:
+            excluded_services = [s.strip().lower() for s in exclude_env.split(',') if s.strip()]
         
         # Check configuration for excluded services
         config = self.config_manager.get_service_config(service_name)
-        is_excluded = config.get('global', {}).get('exclude_from_backup', False)
+        config_excluded = config.get('global', {}).get('exclude_from_backup', False)
         
-        return service_name in excluded_services or is_excluded
+        # Check if service name is in excluded list (case-insensitive)
+        is_excluded = service_name.lower() in excluded_services or config_excluded
+        
+        if is_excluded:
+            logger.info(f"Service {service_name} is excluded from backup")
+        
+        return is_excluded

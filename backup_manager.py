@@ -277,7 +277,7 @@ class BackupManager:
     
     def _is_backup_service(self, service_name: str) -> bool:
         """
-        Check if a service is the backup service itself.
+        Check if a service is the backup service itself using multiple methods.
         
         Args:
             service_name (str): Service name to check.
@@ -287,18 +287,59 @@ class BackupManager:
         """
         # Check environment variable for backup service name
         backup_service_names = os.environ.get('BACKUP_SERVICE_NAMES', 'container-backup,backup')
-        backup_names = [name.strip() for name in backup_service_names.split(',')]
+        backup_names = [name.strip().lower() for name in backup_service_names.split(',')]
         
         # Check current hostname
         try:
             import socket
-            current_hostname = socket.gethostname()
-            if current_hostname == service_name:
+            current_hostname = socket.gethostname().lower()
+            if current_hostname == service_name.lower():
+                logger.debug(f"Self-backup detection: service name matches hostname: {current_hostname}")
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Could not determine current hostname: {str(e)}")
         
-        return service_name in backup_names
+        # Check current container ID
+        try:
+            with open('/proc/self/cgroup', 'r') as f:
+                for line in f:
+                    if 'docker' in line:
+                        current_container_id = line.split('/')[-1].strip()
+                        # If the service has a container with this ID, it's us
+                        for container in self.containers if hasattr(self, 'containers') else []:
+                            if container.id == current_container_id:
+                                logger.debug(f"Self-backup detection: found matching container ID")
+                                return True
+        except Exception as e:
+            logger.debug(f"Could not determine current container ID: {str(e)}")
+        
+        # Check by name
+        if service_name.lower() in backup_names:
+            logger.debug(f"Self-backup detection: service name in backup_names list")
+            return True
+        
+        return False
+
+    def _is_excluded_service(self, service_name: str) -> bool:
+        """
+        Check if a service is excluded from backup via environment variable.
+        
+        Args:
+            service_name (str): Service name to check.
+            
+        Returns:
+            bool: True if excluded, False otherwise.
+        """
+        # Check environment variable for excluded services
+        exclude_env = os.environ.get('EXCLUDE_FROM_BACKUP', '')
+        if not exclude_env.strip():
+            return False
+            
+        # Split by comma and strip whitespace
+        excluded_services = [s.strip().lower() for s in exclude_env.split(',') if s.strip()]
+        
+        # Check if service name is in excluded list (case-insensitive)
+        return service_name.lower() in excluded_services
     
     def apply_retention_policy(self) -> int:
         """
@@ -388,7 +429,8 @@ class BackupManager:
     
     def _run_backup_with_lock(self, service: ServiceBackup) -> bool:
         """
-        Run backup for a service with proper locking.
+        Run backup for a service with proper locking, self-backup detection,
+        and exclusion filter checking.
         
         Args:
             service (ServiceBackup): Service backup instance.
@@ -398,6 +440,16 @@ class BackupManager:
         """
         service_name = service.service_name
         logger.debug(f"Running backup for service: {service_name}")
+        
+        # Check for self-backup
+        if self._is_backup_service(service_name):
+            logger.info(f"Skipping backup of the backup service itself: {service_name}")
+            return True
+        
+        # Check if service is in exclusion list (double check)
+        if self._is_excluded_service(service_name):
+            logger.info(f"Service {service_name} is excluded from backup")
+            return True
         
         # Create lock file
         lock_path = self._create_lock(service_name)
@@ -502,7 +554,7 @@ class BackupManager:
                 'service': service_name,
                 'backup_name': backup_name,
                 'timestamp': time.time(),
-                'pid': os.getpid(),
+                'pid': os.getpid(),  # Use actual process ID, not hardcoded 1
                 'hostname': os.uname().nodename if hasattr(os, 'uname') else 'unknown'
             }
             
@@ -523,15 +575,15 @@ class BackupManager:
             lock_path (Path): Path to lock file.
         """
         try:
-            if lock_path.exists():
+            if lock_path and lock_path.exists():
                 # Read lock file to log what we're removing
                 try:
                     with open(lock_path, 'r') as f:
                         lock_data = json.loads(f.read())
                     logger.debug(f"Removing lock for service {lock_data.get('service')} (PID: {lock_data.get('pid')})")
-                except Exception:
-                    pass
-                
+                except Exception as e:
+                    logger.debug(f"Could not read lock file details: {str(e)}")
+                    
                 # Remove the lock file
                 os.remove(lock_path)
                 logger.debug(f"Lock file removed: {lock_path}")
