@@ -33,8 +33,8 @@ The tool uses Docker to discover running applications and treats each applicatio
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/service-backup.git
-   cd service-backup
+   git clone https://github.com/Joel7homas/container-backup.git
+   cd container-backup
    ```
 
 2. Create necessary directories:
@@ -80,7 +80,7 @@ The system can be used in multiple ways:
 By default, the system runs as a daemon with scheduled backups:
 
 ```bash
-docker exec -it service-backup python main.py schedule --interval 24h
+docker exec -it container-backup python main.py schedule --interval 24h
 ```
 
 This will run backups every 24 hours and apply retention policies accordingly.
@@ -91,10 +91,10 @@ To manually trigger backups:
 
 ```bash
 # Back up all services
-docker exec -it service-backup python main.py backup
+docker exec -it container-backup python main.py backup
 
 # Back up specific services
-docker exec -it service-backup python main.py backup --services wordpress,mysql
+docker exec -it container-backup python main.py backup --services wordpress,mysql
 ```
 
 ### Apply Retention Policies
@@ -102,7 +102,7 @@ docker exec -it service-backup python main.py backup --services wordpress,mysql
 To manually apply retention policies:
 
 ```bash
-docker exec -it service-backup python main.py retention
+docker exec -it container-backup python main.py retention
 ```
 
 ### Check Backup Status
@@ -111,10 +111,10 @@ To view the current backup status:
 
 ```bash
 # Text format (default)
-docker exec -it service-backup python main.py status
+docker exec -it container-backup python main.py status
 
 # JSON format
-docker exec -it service-backup python main.py status --output json
+docker exec -it container-backup python main.py status --output json
 ```
 
 ## Configuration
@@ -272,7 +272,7 @@ service_name_timestamp/
 ### Common Issues
 
 **No backups are being created**:
-- Check container logs: `docker logs service-backup`
+- Check container logs: `docker logs container-backup`
 - Verify Portainer URL and API key are correct
 - Ensure the backup directory has appropriate permissions
 - Check if Docker socket is properly mounted
@@ -297,13 +297,13 @@ service_name_timestamp/
 
 ```bash
 # View all logs
-docker logs service-backup
+docker logs container-backup
 
 # View only error logs
-docker logs service-backup 2>&1 | grep ERROR
+docker logs container-backup 2>&1 | grep ERROR
 
 # Follow logs in real-time
-docker logs -f service-backup
+docker logs -f container-backup
 ```
 
 ## Advanced Usage
