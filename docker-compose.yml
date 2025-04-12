@@ -52,6 +52,7 @@ services:
 #       TASKS: 0       # Disable Swarm task access
 #       VERSION: 1     # Allow version checking
 #       STOP: 1
+#       START: 1
 #       POST: 1
 #     restart: unless-stopped
 #
