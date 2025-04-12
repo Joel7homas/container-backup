@@ -51,6 +51,8 @@ services:
 #       EXEC: 1        # Allow exec commands for database backups
 #       TASKS: 0       # Disable Swarm task access
 #       VERSION: 1     # Allow version checking
+#       STOP: 1
+#       POST: 1
 #     restart: unless-stopped
 #
 #   container-backup:
