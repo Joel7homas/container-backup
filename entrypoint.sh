@@ -11,6 +11,48 @@ log() {
     echo "INFO: $1"
 }
 
+# Create a group with fallback to groupadd if addgroup fails
+create_group_with_fallback() {
+    local group_name="$1"
+    local group_id="$2"
+    
+    # Try addgroup first (Alpine default)
+    if addgroup -g ${group_id} ${group_name} 2>/dev/null; then
+        return 0
+    else
+        log "addgroup failed, trying groupadd for group ${group_name} (${group_id})"
+        # Check if groupadd exists
+        if command -v groupadd >/dev/null 2>&1; then
+            if groupadd -g ${group_id} ${group_name} 2>/dev/null; then
+                return 0
+            fi
+        fi
+    fi
+    
+    return 1
+}
+
+# Add user to group with fallback methods
+add_user_to_group() {
+    local username="$1"
+    local groupname="$2"
+    
+    # Try adduser method (Alpine)
+    if adduser ${username} ${groupname} 2>/dev/null; then
+        return 0
+    else
+        # Try usermod method if available
+        if command -v usermod >/dev/null 2>&1; then
+            log "adduser failed, trying usermod for group ${groupname}"
+            if usermod -a -G ${groupname} ${username} 2>/dev/null; then
+                return 0
+            fi
+        fi
+    fi
+    
+    return 1
+}
+
 # Check if Docker socket exists and get its group ID
 if test -e /var/run/docker.sock
 then
@@ -26,7 +68,7 @@ then
   if ! getent group ${DOCKER_GROUP_GID} > /dev/null
   then
     log "Creating docker group with GID: ${DOCKER_GROUP_GID}"
-    addgroup -g ${DOCKER_GROUP_GID} docker || error "Failed to create docker group"
+    create_group_with_fallback docker ${DOCKER_GROUP_GID} || error "Failed to create docker group"
   else
     # Get the name of the group with this GID
     EXISTING_GROUP=$(getent group ${DOCKER_GROUP_GID} | cut -d: -f1)
@@ -64,13 +106,12 @@ then
     log "Mirroring host user groups for PUID ${PUID}"
     
     # First check if host group file is available
-    if test -e "/host/etc/group"
+    if test -e "/host/etc/group" && test -e "/host/etc/passwd"
     then
-      log "Using /host/etc/group for group discovery"
+      log "Using host group and passwd files for group discovery"
       
-      # Create a unique username to look for in the group file based on PUID
-      # This handles cases where the username in the container doesn't match the host
-      HOST_USER=$(grep -l ":x:${PUID}:" /host/etc/passwd 2>/dev/null | xargs -r cat | cut -d: -f1)
+      # Get host username for UID
+      HOST_USER=$(grep -l "^[^:]*:x:${PUID}:" /host/etc/passwd 2>/dev/null | xargs -r cat | cut -d: -f1)
       if test -n "${HOST_USER}"
       then
         log "Found host username for UID ${PUID}: ${HOST_USER}"
@@ -98,22 +139,39 @@ then
             continue
           fi
           
+          # Check if a group with this GID already exists but with different name
+          EXISTING_GROUP=$(getent group ${group_id} 2>/dev/null | cut -d: -f1)
+          if test -n "${EXISTING_GROUP}" && test "${EXISTING_GROUP}" != "${group_name}"
+          then
+            log "    Group with GID ${group_id} already exists as '${EXISTING_GROUP}'"
+            log "    Adding user to existing group ${EXISTING_GROUP}"
+            add_user_to_group appuser ${EXISTING_GROUP} || log "    Failed to add user to group ${EXISTING_GROUP}"
+            continue
+          fi
+          
           # Create group if it doesn't exist
           if ! getent group ${group_id} > /dev/null
           then
-            addgroup -g ${group_id} ${group_name} 2>/dev/null || 
-              log "    Failed to create group ${group_name} (${group_id})"
+            if create_group_with_fallback ${group_name} ${group_id}; then
+              log "    Created group ${group_name} with GID ${group_id}"
+            else
+              log "    Failed to create group ${group_name} with GID ${group_id}"
+              continue
+            fi
           fi
           
           # Add user to group
-          adduser appuser ${group_name} 2>/dev/null || 
+          if add_user_to_group appuser ${group_name}; then
+            log "    Added appuser to group ${group_name}"
+          else
             log "    Failed to add appuser to group ${group_name}"
+          fi
         done
       else
         log "No additional groups found for UID ${PUID} or user ${HOST_USER}"
       fi
     else
-      log "Could not find host group file - mount /etc/group as /host/etc/group to enable group mirroring"
+      log "Could not find host group or passwd files - mount /etc/group as /host/etc/group and /etc/passwd as /host/etc/passwd"
     fi
   fi
 fi
@@ -130,12 +188,22 @@ then
       group_name=$(echo "${group_spec}" | cut -d: -f1)
       group_id=$(echo "${group_spec}" | cut -d: -f2)
       # Create group with specific GID
-      addgroup -g ${group_id} ${group_name} 2>/dev/null || log "Failed to create group ${group_name}"
+      if create_group_with_fallback ${group_name} ${group_id}; then
+        log "Created group ${group_name} with GID ${group_id}"
+      else
+        log "Failed to create group ${group_name} with GID ${group_id}"
+        continue
+      fi
     else
       group_name="${group_spec}"
     fi
+    
     # Add user to group
-    adduser appuser ${group_name} 2>/dev/null || log "Failed to add user to group ${group_name}"
+    if add_user_to_group appuser ${group_name}; then
+      log "Added user to group ${group_name}"
+    else
+      log "Failed to add user to group ${group_name}"
+    fi
   done
 fi
 
@@ -143,7 +211,14 @@ fi
 if getent group docker > /dev/null
 then
   log "Adding appuser to docker group"
-  adduser appuser docker || error "Failed to add appuser to docker group"
+  add_user_to_group appuser docker || error "Failed to add appuser to docker group"
+fi
+
+# Install additional packages if needed
+if test -n "${INSTALL_PACKAGES}" && test "${INSTALL_PACKAGES}" != "none"
+then
+  log "Installing additional packages: ${INSTALL_PACKAGES}"
+  apk update && apk add --no-cache ${INSTALL_PACKAGES}
 fi
 
 # Print the final user/group setup
@@ -153,3 +228,4 @@ su-exec appuser id
 # Execute the command as appuser
 log "Starting application with command: $@"
 exec su-exec appuser "$@"
+

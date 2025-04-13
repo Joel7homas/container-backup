@@ -1,6 +1,6 @@
 FROM python:3.12-alpine
 
-ARG VERSION=1.0.24-alpha
+ARG VERSION=1.0.25-alpha
 ARG UID=80920
 ARG GID=80920
 
@@ -54,7 +54,8 @@ COPY main.py \
      service_discovery.py \
      /app/
 
-COPY entrypoint.sh /
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 # Set the correct permissions
 RUN chown -R appuser:appuser /app

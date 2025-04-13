@@ -241,16 +241,39 @@ class FileBackup:
             '/backups',
             '/mnt/backups',
             '/cache',
-            '/tmp'
+            '/tmp',
+            '/var/lib/docker'
         ]
         
-        # Combine user-defined and common patterns
-        all_patterns = exclude_patterns + common_excludes
+        # Add paths that don't exist in most containers but we
+        # don't want to see warnings for them
+        nonexistent_paths = [
+            '/data',           # Common path that might not exist
+            '/app/data',       # Common path that might not exist
+            '/config',         # Common path that might not exist
+            '/etc/localtime',  # Often mounted but not needed for backup
+            '/etc/timezone'    # Often mounted but not needed for backup
+        ]
+        
+        # Combine all exclusion patterns
+        all_patterns = exclude_patterns + common_excludes + nonexistent_paths
         
         # Check if path matches any exclusion pattern
         for pattern in all_patterns:
             if pattern in path:
                 logger.debug(f"Path {path} matches exclusion pattern: {pattern}")
+                return True
+        
+        # Check for paths in Docker volume storage that might need special handling
+        if '/var/lib/docker/volumes/' in path:
+            # For Docker volumes, we need specific access permissions
+            # Check if the path is accessible before attempting backup
+            try:
+                if not os.access(path, os.R_OK):
+                    logger.warning(f"Path {path} is not readable, excluding from backup")
+                    return True
+            except (OSError, PermissionError):
+                logger.warning(f"Permission error checking {path}, excluding from backup")
                 return True
         
         return False
