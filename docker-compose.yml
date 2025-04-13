@@ -21,6 +21,8 @@ services:
       - CONFIG_FILE=/app/config/service_configs.json
       - EXCLUDE_FROM_BACKUP=${EXCLUDE_FROM_BACKUP}
       - BACKUP_SERVICE_NAMES=container-backup,backup
+      - BACKUP_METHOD=mounts
+      - EXCLUDE_MOUNT_PATHS=/mnt/media, /mnt/backups, /cache
       - PYTHONUNBUFFERED=1
       # User/Group configuration
       - PUID=34          # UID for the backup user
