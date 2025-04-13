@@ -193,6 +193,8 @@ class ServiceBackup:
         
         # Find all unique bind mounts across containers
         bind_mounts = self._get_unique_bind_mounts()
+        logger.debug(f"Found bind mounts: {bind_mounts}")
+        
         if not bind_mounts:
             logger.warning(f"No bind mounts found for service: {self.service_name}")
             return True
@@ -202,10 +204,14 @@ class ServiceBackup:
         # Back up each bind mount
         success = True
         for mount in bind_mounts:
-            source = mount.get('Source')
+            source = mount.get('source', '')
+            destination = mount.get('destination', '')
+            
+            logger.debug(f"Processing mount - source: {source}, destination: {destination}")
             
             # Skip if source is empty or None
             if not source:
+                logger.warning(f"Empty source in mount, skipping: {mount}")
                 continue
             
             # Create a FileBackup instance with exclusions
@@ -220,8 +226,12 @@ class ServiceBackup:
             output_path = os.path.join(backup_dir, f"mount_{mount_name}.tar.gz")
             
             # Backup the mount
-            mount_success = file_backup.backup(source, output_path)
-            if not mount_success:
+            logger.debug(f"Backing up mount {source} to {output_path}")
+            mount_success = file_backup.backup(output_path)
+            
+            if mount_success:
+                logger.info(f"Successfully backed up bind mount: {source}")
+            else:
                 logger.error(f"Failed to back up bind mount: {source}")
                 success = False
         
@@ -743,14 +753,42 @@ class ServiceBackup:
         archive_path = os.path.join("/backups", f"{self.service_name}_{timestamp}.tar.gz")
         
         try:
+            # Check if backup_dir is empty
+            if not os.listdir(backup_dir):
+                logger.warning(f"No files to archive in {backup_dir}")
+                # Create a minimal archive with just metadata
+                metadata = {
+                    "service_name": self.service_name,
+                    "timestamp": timestamp,
+                    "created_at": datetime.now().isoformat(),
+                    "warning": "No files were backed up for this service",
+                    "containers": [c.name for c in self.containers if hasattr(c, 'name')]
+                }
+                
+                # Write metadata to file
+                metadata_path = os.path.join(backup_dir, "metadata.json")
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+            
             # Create the archive
             if create_tar_gz(backup_dir, archive_path):
                 logger.info(f"Created backup archive: {archive_path}")
+                
+                # Log the size for debugging
+                try:
+                    archive_size = os.path.getsize(archive_path)
+                    logger.info(f"Archive size: {archive_size} bytes")
+                    
+                    if archive_size < 1000:  # Less than 1KB
+                        logger.warning(f"Archive is suspiciously small: {archive_size} bytes")
+                except Exception as e:
+                    logger.error(f"Error checking archive size: {str(e)}")
+                    
                 return archive_path
             else:
                 logger.error(f"Failed to create backup archive")
                 return None
-                
+                    
         except Exception as e:
             logger.error(f"Error creating backup archive: {str(e)}")
             return None
