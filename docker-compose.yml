@@ -6,9 +6,10 @@ services:
     container_name: container-backup
     hostname: container-backup
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro  # Read-only access to Docker socket
-      - /mnt/backups:/backups:rw                     # Persistent backup storage
-      - /mnt/docker/container-backup/config:/app/config  # Configuration files
+      - /var/run/docker.sock:/var/run/docker.sock:ro    # Read-only access to Docker socket
+      - /mnt/backups:/backups:rw                        # Persistent backup storage
+      - /mnt/docker/container-backup/config:/app/config # Configuration files
+      - /etc/group:/host/etc/group:ro                   # Mount host's group file for mirroring
     environment:
       - TZ=${TZ:-America/Denver}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
@@ -20,15 +21,16 @@ services:
       - PORTAINER_INSECURE=${PORTAINER_INSECURE:-false}
       - CONFIG_FILE=/app/config/service_configs.json
       - EXCLUDE_FROM_BACKUP=${EXCLUDE_FROM_BACKUP}
+      - MIRROR_HOST_GROUPS=true  # Enable group mirroring
       - BACKUP_SERVICE_NAMES=container-backup,backup
       - BACKUP_METHOD=mounts
       - EXCLUDE_MOUNT_PATHS=/mnt/media, /mnt/backups, /cache
       - PYTHONUNBUFFERED=1
       # User/Group configuration
-      - PUID=34          # UID for the backup user
-      - PGID=80920       # GID for the backup group
+      - PUID=34                                         # UID for the backup user
+      - PGID=80920                                      # GID for the backup group
       # Optional: Override detected Docker socket GID
-      #- DOCKER_GID=988  # Uncomment and set if Docker socket GID detection fails
+      #- DOCKER_GID=988                                 # Uncomment and set if Docker socket GID detection fails
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/backups') else 1)"]

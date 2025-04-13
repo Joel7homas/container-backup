@@ -510,15 +510,20 @@ def exec_in_container(container: Any, command: str, env: Optional[Dict[str, str]
                 # Failed CLI check, rely on SDK status
                 return (-1, f"Container is not running (status: {container.status})")
         
+        # Make command BusyBox-compatible by replacing problematic patterns
+        busybox_command = _make_busybox_compatible(command)
+        if busybox_command != command:
+            logger.debug(f"Adjusted command for BusyBox compatibility: {busybox_command}")
+        
         # Try to execute the command with additional error context
         try:
-            logger.debug(f"Executing in {container.name} (ID: {container.id[:12]}): {command}")
+            logger.debug(f"Executing in {container.name} (ID: {container.id[:12]}): {busybox_command}")
             
             # Set an execution timeout to prevent hanging
             timeout = int(os.environ.get('DOCKER_EXEC_TIMEOUT', '300'))  # 5 minutes default
             
             result = container.exec_run(
-                cmd=command,
+                cmd=["sh", "-c", busybox_command],  # Use sh -c for consistent shell behavior
                 environment=env,
                 detach=False,
                 tty=False,
@@ -563,6 +568,67 @@ def exec_in_container(container: Any, command: str, env: Optional[Dict[str, str]
         container_id = getattr(container, 'id', 'unknown')
         logger.error(f"Error executing command in {container_name} ({container_id}): {str(e)}")
         return -1, str(e)
+
+def _make_busybox_compatible(command: str) -> str:
+    """
+    Convert command to be compatible with BusyBox shell.
+    
+    Args:
+        command (str): Original command.
+        
+    Returns:
+        str: BusyBox-compatible command.
+    """
+    # Replace problematic test patterns
+    if command.startswith("test") or command.startswith("["):
+        # Fix test commands with &&
+        if " && " in command:
+            # Split by && and create if statements
+            parts = command.split(" && ")
+            # Convert into a more compatible form
+            return "; ".join(parts) + ";"
+        
+        # Fix test commands with ||
+        if " || " in command:
+            # Split by || and create if statements - harder to make this totally robust
+            # without a full parser, but this handles common cases
+            parts = command.split(" || ")
+            # BusyBox-compatible alternative using 'if' statement
+            return f"if {parts[0]}; then true; else {parts[1]}; fi"
+        
+        # Fix test -e with space after
+        command = command.replace("test -e ", "test -e")
+        
+        # Fix test comparison operators when they're not properly spaced
+        # (common pattern for BusyBox issues)
+        for op in ["=", "!=", "-eq", "-ne", "-lt", "-le", "-gt", "-ge"]:
+            command = command.replace(f" {op} ", f" {op} ")
+    
+    # Fix Redis CLI issues
+    if "redis-cli" in command:
+        # Ensure redis-cli path is correct and properly quoted
+        redis_parts = command.split()
+        # If the command is detecting redis-cli with 'which', adjust it
+        if command.startswith("which redis-cli"):
+            return "command -v redis-cli 2>/dev/null && echo EXISTS || echo NOTFOUND"
+        # Otherwise, make redis-cli command more robust
+        for i, part in enumerate(redis_parts):
+            if "redis-cli" in part:
+                # Find redis-cli in path
+                redis_parts[i] = "$(command -v redis-cli 2>/dev/null || echo '/usr/local/bin/redis-cli')"
+                break
+        return " ".join(redis_parts)
+    
+    # Replace general shell logical operators with more compatible forms
+    # Only in top level command, not within quoted strings or parentheses
+    # This is a simplified approach that works for many common cases
+    if " && " in command:
+        # Simple cases where we can replace && with ; then
+        # This won't handle complex nested expressions
+        command = command.replace(" && ", "; ")
+    
+    # Return modified command
+    return command
 
 def validate_docker_environment() -> bool:
     """
