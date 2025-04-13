@@ -419,15 +419,35 @@ class DatabaseBackup:
             import tempfile
             temp_dir = tempfile.mkdtemp(prefix="sqlite_backup_")
             
-            # Find SQLite database files
-            cmd = "find / -name '*.sqlite' -o -name '*.db' -o -name '*.sqlite3'"
-            exit_code, output = exec_in_container(self.container, cmd)
+            # Find SQLite database files with paths that typically contain databases
+            possible_paths = [
+                "/config", "/data", "/app/data", "/var/lib", "/opt", "/usr/local"
+            ]
             
-            if exit_code != 0:
-                logger.error(f"Failed to find SQLite database files: {output}")
-                return False
+            db_files = []
+            for path in possible_paths:
+                # Check if path exists before searching
+                check_cmd = f"[ -d '{path}' ] && echo 'EXISTS' || echo 'NOT_FOUND'"
+                exit_code, check_output = exec_in_container(self.container, check_cmd)
+                
+                if "EXISTS" in check_output:
+                    # Search only in this path to limit permission errors
+                    find_cmd = f"find {path} -name '*.sqlite' -o -name '*.db' -o -name '*.sqlite3'"
+                    exit_code, output = exec_in_container(self.container, find_cmd)
+                    
+                    if exit_code == 0 and output.strip():
+                        # Add found files to our list
+                        db_files.extend([file for file in output.strip().split('\n') if file.strip()])
             
-            db_files = [file for file in output.strip().split('\n') if file.strip()]
+            # If no databases found in common locations, try a root search
+            if not db_files:
+                # Basic command without redirections or shell constructs
+                find_cmd = "find / -name '*.sqlite' -o -name '*.db' -o -name '*.sqlite3'"
+                exit_code, output = exec_in_container(self.container, find_cmd)
+                
+                # Even if there are permission errors, we might still get some results
+                if output.strip():
+                    db_files.extend([file for file in output.strip().split('\n') if file.strip()])
             
             # If specific database specified in credentials, filter the list
             if self.credentials.get('database') and isinstance(self.credentials['database'], str):
@@ -446,8 +466,8 @@ class DatabaseBackup:
             
             if not db_files:
                 logger.error("No SQLite database files found")
-                return False
-            
+                return False            
+
             # Use the first database file found if multiple
             db_file = db_files[0]
             if len(db_files) > 1:

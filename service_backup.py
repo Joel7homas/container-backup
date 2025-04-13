@@ -122,6 +122,25 @@ class ServiceBackup:
             logger.error(f"Error during backup of {self.service_name}: {str(e)}")
             return False
 
+    def _is_system_directory(self, path: str) -> bool:
+        """
+        Check if a path is a system directory that should be excluded.
+        
+        Args:
+            path (str): Path to check.
+            
+        Returns:
+            bool: True if system directory, False otherwise.
+        """
+        system_dirs = [
+            "/proc", "/sys", "/dev", "/run", "/var/run", 
+            "/var/lock", "/tmp", "/var/tmp", "/var/cache",
+            "/etc/hostname", "/etc/hosts", "/etc/resolv.conf",
+            "/mnt/media", "/media", "/backups", "/mnt/backups"
+        ]
+        
+        return any(path == sys_dir or path.startswith(sys_dir + "/") for sys_dir in system_dirs)
+
     def _get_unique_bind_mounts(self) -> List[Dict[str, str]]:
         """
         Get a list of unique bind mounts across all containers in the service.

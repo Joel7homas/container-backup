@@ -85,8 +85,12 @@ def log_startup_info() -> None:
     if not logging.getLogger().handlers:
         configure_logging()
     
+    # Get version from environment variable
+    version = os.environ.get('VERSION', 'unknown')
+    
     # Log system information
     startup_logger.info("Starting Docker backup system")
+    startup_logger.info(f"Version: {version}")
     startup_logger.info(f"Python version: {sys.version}")
     
     # Log environment variables (excluding sensitive data)
