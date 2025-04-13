@@ -1,144 +1,155 @@
-# Container-backup
+# Container-Backup
 
-A tool for discovering and creating backups for containerized services in Docker environments that use Portainer.
+A service-oriented Docker backup system that automatically discovers and backs up Docker containers with consistent database and file snapshots.
 
 ## Overview
 
-Container-backup was conceived as a safety net for Docker projects in a lab environment where services and applications are frequently built and torn down without much attention toward production readiness considerations, or in a homelab environment where administrators need a stop-gap solution until they can get around to setting up a proper backup & recovery solution for each application (at which point, exclusions can be added). 
+Container-Backup is a tool for backing up Docker containers and their associated data. It uses a service-oriented approach that:
 
-The tool uses Docker to discover running applications and treats each application as a service with multiple components, so that all parts of a service (databases, file systems, etc.) are backed up together in a consistent manner to avoid database and file backups being out of sync. 
+1. **Discovers services automatically** by analyzing Docker containers and their relationships
+2. **Ensures backup consistency** by capturing database and application files together
+3. **Uses hot backups** where possible to minimize service disruption
+4. **Falls back to stop/backup/start** when hot backups aren't feasible
+5. **Stores backups in a cohesive manner** for straightforward restoration
 
-### Key Features
+## Features
 
-- **Service-Oriented Architecture**: Treats each application as a complete service with potentially multiple components
-- **Automatic Service Discovery**: Identifies Docker services and their components using Portainer integration
-- **Comprehensive Backup Strategy**: Ensures database and file backups are consistent
-- **Flexible Configuration**: Configure backup behavior per service, with sensible defaults
-- **Intelligent Retention Policies**: Supports time-based, count-based, and mixed retention strategies
-- **Hot Backup Support**: Minimizes service disruption by using hot backups where possible
-- **Graceful Fallback**: Falls back to stop/backup/start when hot backups aren't feasible
-- **Multiple Database Support**: Works with PostgreSQL, MySQL/MariaDB, SQLite, MongoDB, and Redis
-- **Parallel Processing**: Runs backups concurrently with configurable limits
-- **Robust Error Handling**: Ensures backup operations are reliable and recoverable
+- **Service-oriented backups**: Treats applications as services with potentially multiple components
+- **Automatic discovery**: Identifies services, databases, and data paths automatically
+- **Multi-protocol support**: Works with bind mounts, volumes, and other storage mechanisms
+- **Database-aware**: Special handling for PostgreSQL, MySQL, MariaDB, MongoDB, Redis, and SQLite
+- **Configurable retention**: Flexible retention policies for managing backup storage
+- **Custom configuration**: Override defaults with configuration files or environment variables
+- **Low-disruption design**: Minimizes service downtime during backups
+- **Portainer integration**: Works with Portainer for stack environment recognition
+- **Security-focused**: Optional Docker socket proxy support for enhanced security
 
-## Installation
+## Quick Start
 
-### Prerequisites
+### Using Docker Compose
 
-- Docker and Docker Compose
-- Portainer for stack and credential management
-- Access to the Docker socket on the host system
+Create a `docker-compose.yml` file:
 
-### Setup with Docker Compose
+```yaml
+version: '3.8'
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/Joel7homas/container-backup.git
-   cd container-backup
-   ```
+services:
+  # Socket proxy for enhanced security (optional)
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: 1  # Allow container listing/inspection
+      IMAGES: 1      # Allow image operations needed for backups
+      NETWORKS: 1    # Allow network information access
+      SERVICES: 0    # No need for Swarm services
+      VOLUMES: 1     # Allow volume information
+      EXEC: 1        # Allow exec commands for database backups
+      TASKS: 0       # Disable Swarm task access
+      VERSION: 1     # Allow version checking
+      STOP: 1
+      START: 1
+      POST: 1
+    restart: unless-stopped
 
-2. Create necessary directories:
-   ```bash
-   mkdir -p backups config
-   chmod 777 backups  # Ensure the container can write to this directory
-   ```
-
-3. Copy the sample configuration files:
-   ```bash
-   cp stack.env.example stack.env
-   cp config/service_configs.json.example config/service_configs.json
-   ```
-
-4. Edit the environment variables in `stack.env` to match your environment:
-   ```bash
-   PORTAINER_URL=https://your-portainer-url/
-   PORTAINER_API_KEY=your-api-key-here
-   ```
-
-5. Deploy with Docker Compose:
-   ```bash
-   docker-compose --env-file stack.env up -d
-   ```
-
-### Portainer API Key
-
-To generate a Portainer API key:
-
-1. Log in to your Portainer instance
-2. Go to your user profile (click on your username in the top-right corner)
-3. Select "Access Tokens"
-4. Click "Add access token"
-5. Enter a description and set an expiration date
-6. Copy the token value and use it as `PORTAINER_API_KEY` in your stack.env file
-
-## Usage
-
-The system can be used in multiple ways:
-
-### Scheduled Backups (Default)
-
-By default, the system runs as a daemon with scheduled backups:
-
-```bash
-docker exec -it container-backup python main.py schedule --interval 24h
+  container-backup:
+    image: container-backup:1.1
+    container_name: container-backup
+    hostname: container-backup
+    volumes:
+      # Mount with Docker socket proxy
+      # - /var/run/docker.sock:/var/run/docker.sock:ro  # Use this without proxy
+      - /mnt/backups:/backups:rw                      # Persistent backup storage
+      - /mnt/docker:/mnt/docker:ro                    # Read-only access to docker volumes
+      - /app/config:/app/config                       # Configuration files
+      - /etc/group:/host/etc/group:ro                 # Host's group file for mirroring
+      - /etc/passwd:/host/etc/passwd:ro               # Host's passwd file for user discovery
+      - ./entrypoint.sh:/entrypoint.sh:ro             # Custom entrypoint script
+    environment:
+      - TZ=UTC
+      - LOG_LEVEL=INFO
+      - BACKUP_DIR=/backups
+      - MAX_CONCURRENT_BACKUPS=3
+      - BACKUP_RETENTION_DAYS=7
+      - PORTAINER_URL=https://portainer.example.com
+      - PORTAINER_API_KEY=your-api-key-here
+      - PORTAINER_INSECURE=false
+      - CONFIG_FILE=/app/config/service_configs.json
+      - EXCLUDE_FROM_BACKUP=seafile mealie immich
+      - PUID=34                                     # User ID for the backup user
+      - PGID=34                                     # Group ID for the backup user
+      - DOCKER_HOST=tcp://docker-socket-proxy:2375  # Connect to proxy - Remove with direct socket
+      - BACKUP_SERVICE_NAMES=container-backup,backup
+      - BACKUP_METHOD=mounts
+      - EXCLUDE_MOUNT_PATHS=/mnt/media, /mnt/backups, /cache, /var/lib/docker
+      - MIRROR_HOST_GROUPS=true
+      - NFS_MODE=true                               # Enable NFS-specific handling
+      - INSTALL_PACKAGES=shadow                     # Additional packages to install
+    restart: unless-stopped
+    depends_on:
+      - docker-socket-proxy                         # Remove with direct socket
+    entrypoint: ["/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/backups') else 1)"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 ```
 
-This will run backups every 24 hours and apply retention policies accordingly.
+### Running Commands
 
-### Manual Backup
-
-To manually trigger backups:
-
+**Start the backup service:**
 ```bash
-# Back up all services
-docker exec -it container-backup python main.py backup
-
-# Back up specific services
-docker exec -it container-backup python main.py backup --services wordpress,mysql
+docker-compose up -d
 ```
 
-### Apply Retention Policies
-
-To manually apply retention policies:
-
+**Execute a manual backup:**
 ```bash
-docker exec -it container-backup python main.py retention
+docker exec container-backup python main.py backup
 ```
 
-### Check Backup Status
-
-To view the current backup status:
-
+**View backup status:**
 ```bash
-# Text format (default)
-docker exec -it container-backup python main.py status
+docker exec container-backup python main.py status
+```
 
-# JSON format
-docker exec -it container-backup python main.py status --output json
+**Apply retention policies:**
+```bash
+docker exec container-backup python main.py retention
 ```
 
 ## Configuration
 
-The system can be configured in multiple ways:
-
 ### Environment Variables
 
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `PORTAINER_URL` | URL to your Portainer instance | none | Yes |
-| `PORTAINER_API_KEY` | API key for Portainer access | none | Yes |
-| `PORTAINER_INSECURE` | Disable SSL verification | false | No |
-| `LOG_LEVEL` | Log level (DEBUG, INFO, WARNING, ERROR) | INFO | No |
-| `BACKUP_DIR` | Directory to store backups | /backups | No |
-| `MAX_CONCURRENT_BACKUPS` | Maximum number of parallel backups | 3 | No |
-| `BACKUP_RETENTION_DAYS` | Default number of days to keep backups | 7 | No |
-| `EXCLUDE_FROM_BACKUP` | Space-separated list of services to exclude | empty | No |
-| `CONFIG_FILE` | Path to service configuration file | none | No |
-| `TZ` | Timezone for scheduling and logging | UTC | No |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `BACKUP_DIR` | Directory to store backups | `/backups` |
+| `BACKUP_METHOD` | Backup method (`mounts` or `container_cp`) | `mounts` |
+| `BACKUP_RETENTION_DAYS` | Number of days to keep backups | `7` |
+| `BACKUP_SERVICE_NAMES` | Names of this backup service for self-exclusion | `container-backup,backup` |
+| `CONFIG_FILE` | Path to configuration file | `/app/config/service_configs.json` |
+| `DOCKER_HOST` | Docker socket or proxy URL | *empty* |
+| `DOCKER_READ_ONLY` | Restrict Docker API to read-only operations | `true` |
+| `EXCLUDE_FROM_BACKUP` | Space-separated list of services to exclude | *empty* |
+| `EXCLUDE_MOUNT_PATHS` | Comma-separated list of paths to exclude | *empty* |
+| `INSTALL_PACKAGES` | Additional Alpine packages to install | *empty* |
+| `LOG_LEVEL` | Logging level (INFO, DEBUG, etc.) | `INFO` |
+| `MAX_CONCURRENT_BACKUPS` | Maximum number of concurrent backups | `3` |
+| `MIRROR_HOST_GROUPS` | Mirror host user groups | `true` |
+| `NFS_MODE` | Enable NFS-specific optimizations | `false` |
+| `PGID` | Group ID to run as | *current* |
+| `PORTAINER_API_KEY` | Portainer API key | *required* |
+| `PORTAINER_INSECURE` | Allow insecure connections to Portainer | `false` |
+| `PORTAINER_URL` | Portainer API URL | *required* |
+| `PUID` | User ID to run as | *current* |
+| `TZ` | Timezone | `UTC` |
 
 ### Service Configuration
 
-Service configurations can be defined in a JSON file and mounted to `/app/config/service_configs.json`:
+Create a `service_configs.json` file in your config directory:
 
 ```json
 {
@@ -158,231 +169,102 @@ Service configurations can be defined in a JSON file and mounted to `/app/config
       "exclude_from_backup": false,
       "priority": 10
     }
+  },
+  "nextcloud": {
+    "database": {
+      "type": "postgres",
+      "requires_stopping": false,
+      "container_patterns": ["*postgres*", "*db*"]
+    },
+    "files": {
+      "data_paths": ["data", "config", "themes", "apps"],
+      "requires_stopping": true,
+      "exclusions": ["data/appdata*/cache/*", "data/*/cache/*", "data/*/files_trashbin/*"]
+    },
+    "global": {
+      "mixed_retention": {
+        "daily": 7,
+        "weekly": 4,
+        "monthly": 2
+      },
+      "priority": 20
+    }
   }
 }
 ```
 
-#### Configuration Options
+## System Requirements
 
-- **database**:
-  - `type`: Database type (postgres, mysql, sqlite, mongodb, redis)
-  - `requires_stopping`: Whether to stop containers for backup
-  - `container_patterns`: Patterns to identify database containers
-  - `credentials`: Optional hardcoded credentials
+- Docker 20.10.0 or later
+- Python 3.9 or later
+- Access to the Docker socket or Docker socket proxy
+- Volume mounts for persistent storage
 
-- **files**:
-  - `data_paths`: Paths to back up
-  - `requires_stopping`: Whether to stop containers for backup
-  - `exclusions`: Patterns to exclude from backup
+## Advanced Configuration
 
-- **global**:
-  - `backup_retention`: Days to keep backups
-  - `exclude_from_backup`: Whether to exclude this service
-  - `priority`: Backup priority (lower numbers first)
-  - `mixed_retention`: Configure complex retention policies
+### Custom Entrypoint Script
 
-### Environment-Based Configuration
-
-Service configurations can also be provided via environment variables:
+You can customize the entrypoint script to handle special use cases like complex group memberships, particularly in NFS environments.
 
 ```bash
-SERVICE_CONFIG_WORDPRESS={"database":{"type":"mysql"},"files":{"exclusions":["cache"]}}
+#!/bin/bash
+
+# Function to handle errors
+error() { 
+    echo "ERROR: $1"
+    exit 1
+}
+
+# Function to log information
+log() { 
+    echo "INFO: $1"
+}
+
+# ... Rest of the entrypoint script ...
 ```
 
-## How It Works
+### NFS Environments
 
-### Service Discovery
-
-The system discovers services based on:
-
-1. Docker containers running on the host
-2. Container labels and relationships
-3. Portainer stack information
-
-Services are identified based on Portainer stacks, Docker Compose projects, or container relationships.
-
-### Backup Process
-
-For each service:
-
-1. **Preparation**:
-   - Determine if service requires stopping
-   - Create temporary staging directory
-
-2. **Database Backup**:
-   - For each database container:
-     - Retrieve credentials from Portainer
-     - Execute appropriate backup command based on database type
-     - Store compressed backup in staging directory
-
-3. **File Backup**:
-   - For each data path:
-     - Apply exclusion filters
-     - Archive and compress files to staging directory
-
-4. **Consolidation**:
-   - Create single timestamp-named archive containing all service components
-   - Move to final backup location
-
-5. **Cleanup**:
-   - Remove temporary files
-   - Start any stopped containers
-   - Apply retention policies
-
-### Retention Policies
-
-The system supports multiple retention strategies:
-
-- **Time-Based**: Keep backups for X days
-- **Count-Based**: Keep the most recent X backups
-- **Mixed**: Keep daily backups for a week, weekly for a month, monthly for a year
-
-### Database Support
-
-- **PostgreSQL**: Uses `pg_dump` with properly sourced credentials
-- **MySQL/MariaDB**: Uses `mysqldump` with properly sourced credentials
-- **SQLite**: Uses file-based backup of `.db`/`.sqlite`/`.sqlite3` files
-- **MongoDB**: Uses `mongodump` with properly sourced credentials
-- **Redis**: Uses `redis-cli --rdb` command or RDB file copy
-
-## Backup File Structure
-
-Backups are stored in the following format:
-
-```
-/backups/
-├── service1_20250409_010000.tar.gz
-├── service1_20250410_010000.tar.gz
-└── service2_20250409_010000.tar.gz
-```
-
-Each archive contains:
-
-```
-service_name_timestamp/
-├── databases/
-│   └── db_container_name.sql.gz
-├── files/
-│   └── app_data.tar.gz
-└── metadata.json
-```
+When using NFS mounts, enable `NFS_MODE=true` and ensure your host's groups are properly mirrored with `MIRROR_HOST_GROUPS=true`.
 
 ## Troubleshooting
 
 ### Common Issues
 
-**No backups are being created**:
-- Check container logs: `docker logs container-backup`
-- Verify Portainer URL and API key are correct
-- Ensure the backup directory has appropriate permissions
-- Check if Docker socket is properly mounted
+#### Permission Denied Errors
 
-**Error connecting to Portainer**:
-- Verify the Portainer URL is accessible from the container
-- Ensure the API key has not expired
-- Check network connectivity
-- Try setting `PORTAINER_INSECURE=true` if using self-signed certificates
+If you see permission denied errors when accessing bind mounts:
 
-**Cannot find database credentials**:
-- Verify that environment variables in your stack contain database credentials
-- Check container logs for available environment variables
-- Ensure the container is associated with a Portainer stack
+1. Check that the PUID/PGID match the owner of your backup directories
+2. Ensure `MIRROR_HOST_GROUPS=true` and mount `/etc/group:/host/etc/group:ro`
+3. For NFS mounts, enable `NFS_MODE=true`
 
-**Database backup fails**:
-- Check if the database type is correctly identified
-- Verify that the necessary backup tools are available in the container
-- Check if the database is accessible (network, credentials)
+#### Docker Socket Access
 
-### Viewing Logs
+If you see Docker API access errors:
 
-```bash
-# View all logs
-docker logs container-backup
+1. Verify the container has access to the Docker socket
+2. Check that the socket has proper permissions
+3. Consider using the Docker socket proxy for improved security
 
-# View only error logs
-docker logs container-backup 2>&1 | grep ERROR
+#### Database Backup Failures
 
-# Follow logs in real-time
-docker logs -f container-backup
-```
+If database backups fail:
 
-## Advanced Usage
-
-### Custom Retention Policies
-
-The system supports sophisticated retention policies:
-
-```json
-"global": {
-  "mixed_retention": {
-    "daily": 7,   // Keep 7 daily backups
-    "weekly": 4,  // Keep 4 weekly backups
-    "monthly": 3  // Keep 3 monthly backups
-  }
-}
-```
-
-### Multiple Database Handling
-
-For services with multiple databases:
-
-```json
-"myservice": {
-  "database": {
-    "type": "postgres",
-    "container_patterns": ["*postgres*", "*pg*", "*postgresql*"]
-  }
-}
-```
-
-### Excluding Paths from Backup
-
-To exclude certain paths from file backups:
-
-```json
-"files": {
-  "exclusions": [
-    "tmp/*",
-    "cache/*",
-    "*.log",
-    "node_modules/*"
-  ]
-}
-```
-
-### Backing Up Without Stopping Services
-
-For most databases, hot backups are supported:
-
-```json
-"database": {
-  "requires_stopping": false
-}
-```
-
-## Security Considerations
-
-- The container needs read access to the Docker socket, which gives it significant privileges
-- Database credentials are retrieved and used in memory but not stored persistently
-- Consider restricting the Portainer API key permissions to only what's necessary
-- Encrypt backup storage or transfer if containing sensitive data
-
-## Contributing
-
-Contributions are welcome:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
-
-Please ensure your code follows the project's style guidelines and includes appropriate tests.
+1. Ensure the database container is accessible
+2. Check that the backup user has sufficient permissions
+3. Verify that database paths are correctly detected
 
 ## License
 
-This project is distributed under the zlib License. See the LICENSE file for details.
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-## Disclaimer
+## Contributing
 
-This tool is designed as a comprehensive backup solution for Docker-based services. While it aims to be robust and reliable, always ensure you have a proper backup and recovery strategy in place for mission-critical systems.
+Contributions are welcome! Please feel free to submit a Pull Request.
 
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
