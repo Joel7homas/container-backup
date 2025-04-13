@@ -420,7 +420,7 @@ class DatabaseBackup:
         db_files = []
         for path in possible_paths:
             # Check if path exists before searching
-            check_cmd = f"test -d '{path}' && echo 'EXISTS' || echo 'NOTFOUND'"
+            check_cmd = f"[ -d '{path}' ] && echo 'EXISTS' || echo 'NOTFOUND'"
             exit_code, check_output = exec_in_container(self.container, check_cmd)
             
             if "EXISTS" in check_output:
