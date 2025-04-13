@@ -55,11 +55,24 @@ class DatabaseBackup:
             logger.error(f"Invalid path type: {type(path)}")
             return False
         
+        if not path:
+            logger.error("Empty path provided")
+            return False
+        
         # Check for potentially dangerous characters
-        dangerous_chars = [';', '&&', '||', '`', '$', '|', '>', '<', '*', '?', '[', ']']
+        dangerous_chars = [';', '&&', '||', '`', '$', '|', '>', '<']
         if any(c in path for c in dangerous_chars):
             logger.error(f"Path contains dangerous characters: {path}")
             return False
+        
+        # Wildcard characters (* and ?) are allowed in exclusion patterns
+        # but not in actual paths being backed up
+        if '*' in path or '?' in path:
+            # Check context - if this is being used in _apply_exclusions, it's ok
+            calling_function = sys._getframe(1).f_code.co_name
+            if calling_function != '_apply_exclusions':
+                logger.error(f"Path contains wildcard characters: {path}")
+                return False
         
         return True
     
@@ -407,7 +420,7 @@ class DatabaseBackup:
             temp_dir = tempfile.mkdtemp(prefix="sqlite_backup_")
             
             # Find SQLite database files
-            cmd = "find / -name '*.sqlite' -o -name '*.db' -o -name '*.sqlite3' 2>/dev/null"
+            cmd = "find / -name '*.sqlite' -o -name '*.db' -o -name '*.sqlite3'"
             exit_code, output = exec_in_container(self.container, cmd)
             
             if exit_code != 0:

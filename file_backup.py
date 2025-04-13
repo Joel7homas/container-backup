@@ -457,6 +457,7 @@ class FileBackup:
             logger.error(f"Error detecting data paths: {str(e)}")
             return ["/"]
     
+
     def _is_system_directory(self, path: str) -> bool:
         """
         Check if a path is a system directory that should be excluded.
@@ -470,8 +471,8 @@ class FileBackup:
         system_dirs = [
             "/proc", "/sys", "/dev", "/run", "/var/run", 
             "/var/lock", "/tmp", "/var/tmp", "/var/cache",
-            "/etc/hostname", "/etc/hosts", "/etc/resolv.conf"
+            "/etc/hostname", "/etc/hosts", "/etc/resolv.conf",
+            "/mnt/media", "/media", "/backups", "/mnt/backups"
         ]
         
         return any(path == sys_dir or path.startswith(sys_dir + "/") for sys_dir in system_dirs)
-

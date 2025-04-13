@@ -122,6 +122,44 @@ class ServiceBackup:
             logger.error(f"Error during backup of {self.service_name}: {str(e)}")
             return False
 
+    def _get_unique_bind_mounts(self) -> List[Dict[str, str]]:
+        """
+        Get a list of unique bind mounts across all containers in the service.
+        
+        Returns:
+            list: List of unique bind mount dictionaries.
+        """
+        unique_mounts = []
+        seen_sources = set()
+        
+        # Process each container in the service
+        for container in self.containers:
+            try:
+                # Get mounts for this container
+                from utils.docker_utils import get_container_mounts
+                mounts = get_container_mounts(container)
+                
+                # Filter for bind mounts
+                for mount in mounts:
+                    source = mount.get('source', '')
+                    
+                    # Skip if empty source or already seen
+                    if not source or source in seen_sources:
+                        continue
+                    
+                    # Skip system directories
+                    if self._is_system_directory(source):
+                        continue
+                    
+                    # Add to unique mounts and track source
+                    unique_mounts.append(mount)
+                    seen_sources.add(source)
+                    
+            except Exception as e:
+                logger.error(f"Error getting mounts for container {container.name}: {str(e)}")
+        
+        return unique_mounts
+
     def _backup_bind_mounts(self, backup_dir: str) -> bool:
         """
         Back up bind mounts with path exclusion support.

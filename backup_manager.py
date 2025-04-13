@@ -590,20 +590,22 @@ class BackupManager:
         except Exception as e:
             logger.error(f"Error removing lock file {lock_path}: {str(e)}")
 
-    def _check_stale_locks(self) -> None:
+    def _check_stale_locks(self) -> int:
         """
         Check for and remove stale lock files.
         
         A lock is considered stale if:
         - It's older than 3 hours
         - The process that created it is no longer running
+        
+        Returns:
+            int: Number of stale locks removed
         """
         logger.debug("Checking for stale locks")
+        stale_locks_removed = 0
         
         # Create lock directory if it doesn't exist
-        lock_dir = os.environ.get('LOCK_DIR', '/tmp/container-backup/locks')
-        self.lock_dir = Path(lock_dir)
-        self.lock_dir.mkdir(parents=True, exist_ok=True)
+        os.makedirs(self.lock_dir, exist_ok=True)
         
         # Check all lock files
         for lock_file in self.lock_dir.glob('*.lock'):
@@ -614,16 +616,22 @@ class BackupManager:
                 # Try to parse as JSON
                 try:
                     lock_data = json.loads(lock_data_str)
-                    timestamp = lock_data.get('timestamp', 0)
-                    pid = lock_data.get('pid', 0)
+                    timestamp = lock_data.get('timestamp', 0)  # Default to 0 if not present
+                    pid = lock_data.get('pid', 0)  # Default to 0 if not present
                 except (json.JSONDecodeError, TypeError):
                     # Handle old format or invalid JSON
                     logger.warning(f"Lock file {lock_file} has invalid format, treating as stale")
                     os.remove(lock_file)
+                    stale_locks_removed += 1
                     continue
                     
                 # Check if lock is stale
                 current_time = time.time()
+                
+                # Ensure timestamp is a number
+                if timestamp is None:
+                    timestamp = 0
+                    
                 is_stale = current_time - timestamp > 3 * 3600  # 3 hours
                 
                 # Check if process still exists
@@ -641,8 +649,11 @@ class BackupManager:
                     service_name = os.path.basename(lock_file).replace('.lock', '')
                     logger.warning(f"Removing stale lock for {service_name} (PID: {pid})")
                     os.remove(lock_file)
+                    stale_locks_removed += 1
             except Exception as e:
                 logger.error(f"Error checking lock file {lock_file}: {str(e)}")
+        
+        return stale_locks_removed
     
     def _update_retention_config(self, services: List[ServiceBackup]) -> None:
         """
