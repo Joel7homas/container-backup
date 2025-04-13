@@ -431,7 +431,7 @@ class FileBackup:
             ]
             
             for path in common_paths:
-                check_cmd = f"[ -d '{path}' ] && echo 'EXISTS' || echo 'NOT_FOUND'"
+                check_cmd = f"test -d '{path}' && echo 'EXISTS' || echo 'NOT_FOUND'"
                 exit_code, output = exec_in_container(self.container, check_cmd)
                 
                 if "EXISTS" in output:
