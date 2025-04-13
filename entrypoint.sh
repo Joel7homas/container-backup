@@ -100,6 +100,22 @@ then
   # Set correct permissions on directories
   chown -R appuser:appuser /app /backups
 
+  # Add NFS-specific groups if they exist
+  # These typically need to be added regardless of host group membership
+  for gid in 8 988 999 1000 1001 2999 3000 3001 3002 3003 3004 3005 3006 3007 3008 3009 3010 3011 3012 3013 8675309; do
+    group_name=$(getent group $gid 2>/dev/null | cut -d: -f1)
+    if test -n "$group_name"; then
+      log "Adding user to NFS-important group $group_name (GID: $gid)"
+      add_user_to_group appuser $group_name
+    else
+      # Try to create the group with numeric name if it doesn't exist
+      if create_group_with_fallback "group_$gid" $gid; then
+        log "Created numeric group group_$gid (GID: $gid)"
+        add_user_to_group appuser "group_$gid"
+      fi
+    fi
+  done
+
   # Mirror host user groups for the PUID
   if test -n "${MIRROR_HOST_GROUPS}" && test "${MIRROR_HOST_GROUPS}" = "true"
   then
@@ -111,7 +127,7 @@ then
       log "Using host group and passwd files for group discovery"
       
       # Get host username for UID
-      HOST_USER=$(grep -l "^[^:]*:x:${PUID}:" /host/etc/passwd 2>/dev/null | xargs -r cat | cut -d: -f1)
+      HOST_USER=$(grep "^[^:]*:x:${PUID}:" /host/etc/passwd 2>/dev/null | cut -d: -f1)
       if test -n "${HOST_USER}"
       then
         log "Found host username for UID ${PUID}: ${HOST_USER}"
@@ -119,16 +135,26 @@ then
         HOST_USER="backup"  # Fallback to a common name like 'backup'
         log "No host username found for UID ${PUID}, using fallback: ${HOST_USER}"
       fi
+
+      # Check for user 'backup' in groups even if it's not the host user
+      if test "${HOST_USER}" != "backup"; then
+        BACKUP_USER="backup"
+        log "Also checking for group membership of user: ${BACKUP_USER}"
+      fi
       
-      # Find groups where:
-      # 1. The group has UID as direct owner (3rd field) - ":x:$PUID:"
-      # 2. The group has the username as a member (4th field) - ":$HOST_USER," or ",$HOST_USER," or ",$HOST_USER$"
-      GROUP_LIST=$(grep -E "(:[^:]*:${PUID}:)|(:[^:]*:[^:]*:([^,]*,)*${HOST_USER}(,[^,]*)*$)" /host/etc/group)
+      # Find groups where the user is a member - fixed regex
+      GROUP_LIST=$(grep -E ".*:.*:[0-9]+:.*(^|,)${HOST_USER}(,|$)" /host/etc/group)
+      if test -n "${BACKUP_USER}"; then
+        BACKUP_GROUPS=$(grep -E ".*:.*:[0-9]+:.*(^|,)${BACKUP_USER}(,|$)" /host/etc/group)
+        if test -n "${BACKUP_GROUPS}"; then
+          GROUP_LIST="${GROUP_LIST}"$'\n'"${BACKUP_GROUPS}"
+        fi
+      fi
       
       if test -n "${GROUP_LIST}"
       then
-        log "Found groups for user ${HOST_USER} (${PUID}):"
-        echo "${GROUP_LIST}" | while IFS=: read -r group_name group_pass group_id group_members
+        log "Found groups with user as member:"
+        echo "${GROUP_LIST}" | sort | uniq | while IFS=: read -r group_name group_pass group_id group_members
         do
           log "  - ${group_name} (GID: ${group_id})"
           
@@ -221,6 +247,18 @@ then
   apk update && apk add --no-cache ${INSTALL_PACKAGES}
 fi
 
+# If this is an NFS environment, set NFS_MODE to "true"
+if test -n "${NFS_MODE}" && test "${NFS_MODE}" = "true"
+then
+  log "NFS mode enabled - using more aggressive permission handling"
+  
+  # In NFS mode, set umask to ensure files are created with relaxed permissions
+  umask 0002
+  
+  # Optionally, we can try remounting with different options
+  # This would require additional privileges
+fi
+
 # Print the final user/group setup
 log "Running as:"
 su-exec appuser id
@@ -228,4 +266,3 @@ su-exec appuser id
 # Execute the command as appuser
 log "Starting application with command: $@"
 exec su-exec appuser "$@"
-

@@ -245,14 +245,16 @@ class FileBackup:
             '/var/lib/docker'
         ]
         
-        # Add paths that don't exist in most containers but we
-        # don't want to see warnings for them
+        # Add paths that don't exist in most containers or cause false warnings
         nonexistent_paths = [
-            '/data',           # Common path that might not exist
-            '/app/data',       # Common path that might not exist
-            '/config',         # Common path that might not exist
-            '/etc/localtime',  # Often mounted but not needed for backup
-            '/etc/timezone'    # Often mounted but not needed for backup
+            '/data',                # Common path that might not exist
+            '/app/data',            # Common path that might not exist
+            '/config',              # Common path that might not exist
+            '/etc/localtime',       # Often mounted but not needed for backup
+            '/etc/timezone',        # Often mounted but not needed for backup
+            '/var/lib/bluetooth',   # Often causes permission errors
+            '/root',                # Home directory that might be restricted
+            '/home'                 # Home directories often have restricted permissions
         ]
         
         # Combine all exclusion patterns
@@ -262,6 +264,22 @@ class FileBackup:
         for pattern in all_patterns:
             if pattern in path:
                 logger.debug(f"Path {path} matches exclusion pattern: {pattern}")
+                return True
+        
+        # Check for paths that might be problematic with NFS
+        if '/mnt/docker/' in path:
+            # For paths on NFS mounts, check if the path is actually readable
+            try:
+                # Try a lightweight check first - exists and listdir access
+                if not os.path.exists(path):
+                    logger.debug(f"Path does not exist: {path}")
+                    return True
+                    
+                # Try to list directory contents as an access check
+                if os.path.isdir(path):
+                    os.listdir(path)
+            except (PermissionError, OSError) as e:
+                logger.warning(f"Cannot access {path}: {str(e)}, excluding from backup")
                 return True
         
         # Check for paths in Docker volume storage that might need special handling
