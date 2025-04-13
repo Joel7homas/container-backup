@@ -10,6 +10,7 @@ import os
 import gzip
 import time
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union, Tuple
 
