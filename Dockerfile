@@ -1,6 +1,6 @@
 FROM python:3.12-alpine
 
-ARG VERSION=1.0.23-alpha
+ARG VERSION=1.0.24-alpha
 ARG UID=80920
 ARG GID=80920
 
@@ -54,133 +54,10 @@ COPY main.py \
      service_discovery.py \
      /app/
 
+COPY entrypoint.sh /
+
 # Set the correct permissions
 RUN chown -R appuser:appuser /app
-
-# Create an improved entrypoint script that handles Docker group and runtime UID/GID
-RUN echo '#!/bin/bash' > /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '# Function to handle errors' >> /entrypoint.sh && \
-    echo 'error() { echo "ERROR: $1"; exit 1; }' >> /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '# Function to log information' >> /entrypoint.sh && \
-    echo 'log() { echo "INFO: $1"; }' >> /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '# Check if Docker socket exists and get its group ID' >> /entrypoint.sh && \
-    echo 'if test -e /var/run/docker.sock' >> /entrypoint.sh && \
-    echo 'then' >> /entrypoint.sh && \
-    echo '  # Get the GID of the docker socket' >> /entrypoint.sh && \
-    echo '  DOCKER_SOCKET_GID=$(stat -c "%g" /var/run/docker.sock)' >> /entrypoint.sh && \
-    echo '  log "Docker socket found with GID: ${DOCKER_SOCKET_GID}"' >> /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '  # Use DOCKER_GID from environment if provided, otherwise use detected GID' >> /entrypoint.sh && \
-    echo '  DOCKER_GROUP_GID=${DOCKER_GID:-$DOCKER_SOCKET_GID}' >> /entrypoint.sh && \
-    echo '  log "Using Docker GID: ${DOCKER_GROUP_GID}"' >> /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '  # Create the docker group if it does not exist yet' >> /entrypoint.sh && \
-    echo '  if ! getent group ${DOCKER_GROUP_GID} > /dev/null' >> /entrypoint.sh && \
-    echo '  then' >> /entrypoint.sh && \
-    echo '    log "Creating docker group with GID: ${DOCKER_GROUP_GID}"' >> /entrypoint.sh && \
-    echo '    addgroup -g ${DOCKER_GROUP_GID} docker || error "Failed to create docker group"' >> /entrypoint.sh && \
-    echo '  else' >> /entrypoint.sh && \
-    echo '    # Get the name of the group with this GID' >> /entrypoint.sh && \
-    echo '    EXISTING_GROUP=$(getent group ${DOCKER_GROUP_GID} | cut -d: -f1)' >> /entrypoint.sh && \
-    echo '    if test "$EXISTING_GROUP" != "docker"' >> /entrypoint.sh && \
-    echo '    then' >> /entrypoint.sh && \
-    echo '      log "Renaming existing group ${EXISTING_GROUP} to docker"' >> /entrypoint.sh && \
-    echo '      sed -i "s/^${EXISTING_GROUP}:/docker:/" /etc/group || error "Failed to rename group"' >> /entrypoint.sh && \
-    echo '    else' >> /entrypoint.sh && \
-    echo '      log "Docker group already exists with correct GID"' >> /entrypoint.sh && \
-    echo '    fi' >> /entrypoint.sh && \
-    echo '  fi' >> /entrypoint.sh && \
-    echo 'else' >> /entrypoint.sh && \
-    echo '  log "Docker socket not found at /var/run/docker.sock"' >> /entrypoint.sh && \
-    echo 'fi' >> /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '# Handle runtime UID/GID changes' >> /entrypoint.sh && \
-    echo 'if test -n "${PUID}" && test -n "${PGID}"' >> /entrypoint.sh && \
-    echo 'then' >> /entrypoint.sh && \
-    echo '  log "Changing user/group IDs at runtime to ${PUID}:${PGID}"' >> /entrypoint.sh && \
-    echo '  # Try to delete user and group, but don'\''t fail if not found' >> /entrypoint.sh && \
-    echo '  deluser appuser 2>/dev/null || true' >> /entrypoint.sh && \
-    echo '  delgroup appuser 2>/dev/null || true' >> /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '  # Create group and user with new IDs' >> /entrypoint.sh && \
-    echo '  addgroup -g ${PGID} appuser || error "Failed to create appuser group with GID ${PGID}"' >> /entrypoint.sh && \
-    echo '  adduser -D -u ${PUID} -G appuser -s /bin/sh appuser || error "Failed to create appuser with UID ${PUID}"' >> /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '  # Set correct permissions on directories' >> /entrypoint.sh && \
-    echo '  chown -R appuser:appuser /app /backups' >> /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '  # Mirror host user groups from the PUID' >> /entrypoint.sh && \
-    echo '  if test -n "${MIRROR_HOST_GROUPS}" && test "${MIRROR_HOST_GROUPS}" = "true"' >> /entrypoint.sh && \
-    echo '  then' >> /entrypoint.sh && \
-    echo '    log "Mirroring host user groups for PUID ${PUID}"' >> /entrypoint.sh && \
-    echo '    # First check if nsswitch is available to query host groups' >> /entrypoint.sh && \
-    echo '    if test -e "/host/etc/group"' >> /entrypoint.sh && \
-    echo '    then' >> /entrypoint.sh && \
-    echo '      log "Using /host/etc/group for group discovery"' >> /entrypoint.sh && \
-    echo '      # Extract all groups that PUID belongs to on host' >> /entrypoint.sh && \
-    echo '      HOST_GROUPS=$(grep -E ":([^:]*,)?${PUID}(,[^:]*)?:" /host/etc/group | cut -d: -f1,3 || true)' >> /entrypoint.sh && \
-    echo '      if test -n "${HOST_GROUPS}"' >> /entrypoint.sh && \
-    echo '      then' >> /entrypoint.sh && \
-    echo '        # Create each group and add user to it' >> /entrypoint.sh && \
-    echo '        echo "${HOST_GROUPS}" | while IFS=: read -r group_name group_id' >> /entrypoint.sh && \
-    echo '        do' >> /entrypoint.sh && \
-    echo '          log "Adding appuser to group ${group_name} (${group_id})"' >> /entrypoint.sh && \
-    echo '          # Create group if it doesn'\''t exist' >> /entrypoint.sh && \
-    echo '          if ! getent group ${group_id} > /dev/null' >> /entrypoint.sh && \
-    echo '          then' >> /entrypoint.sh && \
-    echo '            addgroup -g ${group_id} ${group_name} || log "Failed to create group ${group_name}"' >> /entrypoint.sh && \
-    echo '          fi' >> /entrypoint.sh && \
-    echo '          # Add user to group' >> /entrypoint.sh && \
-    echo '          adduser appuser ${group_name} 2>/dev/null || log "Failed to add user to group ${group_name}"' >> /entrypoint.sh && \
-    echo '        done' >> /entrypoint.sh && \
-    echo '      else' >> /entrypoint.sh && \
-    echo '        log "No additional groups found for UID ${PUID}"' >> /entrypoint.sh && \
-    echo '      fi' >> /entrypoint.sh && \
-    echo '    else' >> /entrypoint.sh && \
-    echo '      log "Could not find host group file - mount /etc/group as /host/etc/group to enable group mirroring"' >> /entrypoint.sh && \
-    echo '    fi' >> /entrypoint.sh && \
-    echo '  fi' >> /entrypoint.sh && \
-    echo 'fi' >> /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '# Manually add specified groups if provided' >> /entrypoint.sh && \
-    echo 'if test -n "${ADDITIONAL_GROUPS}"' >> /entrypoint.sh && \
-    echo 'then' >> /entrypoint.sh && \
-    echo '  log "Adding user to additional groups: ${ADDITIONAL_GROUPS}"' >> /entrypoint.sh && \
-    echo '  for group_spec in $(echo "${ADDITIONAL_GROUPS}" | tr "," " ")' >> /entrypoint.sh && \
-    echo '  do' >> /entrypoint.sh && \
-    echo '    # Check if group specification includes GID (format: name:GID)' >> /entrypoint.sh && \
-    echo '    if echo "${group_spec}" | grep -q ":"' >> /entrypoint.sh && \
-    echo '    then' >> /entrypoint.sh && \
-    echo '      group_name=$(echo "${group_spec}" | cut -d: -f1)' >> /entrypoint.sh && \
-    echo '      group_id=$(echo "${group_spec}" | cut -d: -f2)' >> /entrypoint.sh && \
-    echo '      # Create group with specific GID' >> /entrypoint.sh && \
-    echo '      addgroup -g ${group_id} ${group_name} 2>/dev/null || log "Failed to create group ${group_name}"' >> /entrypoint.sh && \
-    echo '    else' >> /entrypoint.sh && \
-    echo '      group_name="${group_spec}"' >> /entrypoint.sh && \
-    echo '    fi' >> /entrypoint.sh && \
-    echo '    # Add user to group' >> /entrypoint.sh && \
-    echo '    adduser appuser ${group_name} 2>/dev/null || log "Failed to add user to group ${group_name}"' >> /entrypoint.sh && \
-    echo '  done' >> /entrypoint.sh && \
-    echo 'fi' >> /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '# Add appuser to the docker group if it exists' >> /entrypoint.sh && \
-    echo 'if getent group docker > /dev/null' >> /entrypoint.sh && \
-    echo 'then' >> /entrypoint.sh && \
-    echo '  log "Adding appuser to docker group"' >> /entrypoint.sh && \
-    echo '  adduser appuser docker || error "Failed to add appuser to docker group"' >> /entrypoint.sh && \
-    echo 'fi' >> /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '# Print the final user/group setup' >> /entrypoint.sh && \
-    echo 'log "Running as:"' >> /entrypoint.sh && \
-    echo 'su-exec appuser id' >> /entrypoint.sh && \
-    echo '' >> /entrypoint.sh && \
-    echo '# Execute the command as appuser' >> /entrypoint.sh && \
-    echo 'log "Starting application with command: $@"' >> /entrypoint.sh && \
-    echo 'exec su-exec appuser "$@"' >> /entrypoint.sh && \
-    chmod +x /entrypoint.sh
 
 # Switch to the entrypoint script
 ENTRYPOINT ["/entrypoint.sh"]
