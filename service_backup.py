@@ -214,25 +214,28 @@ class ServiceBackup:
                 logger.warning(f"Empty source in mount, skipping: {mount}")
                 continue
             
-            # Create a FileBackup instance with exclusions
-            file_backup = FileBackup(
-                container=None,  # Not needed for bind mounts
-                paths=[source],
-                exclusions=self.config.get('file_exclusions', [])
-            )
-            
-            # Create output path for this mount
-            mount_name = os.path.basename(source)
-            output_path = os.path.join(backup_dir, f"mount_{mount_name}.tar.gz")
-            
-            # Backup the mount
-            logger.debug(f"Backing up mount {source} to {output_path}")
-            mount_success = file_backup.backup(output_path)
-            
-            if mount_success:
-                logger.info(f"Successfully backed up bind mount: {source}")
-            else:
-                logger.error(f"Failed to back up bind mount: {source}")
+            # Directly create a tar archive of the source path
+            try:
+                # Create output path for this mount
+                mount_name = os.path.basename(source)
+                output_path = os.path.join(backup_dir, f"mount_{mount_name}.tar.gz")
+                
+                # Use archive_utils directly instead of FileBackup
+                logger.debug(f"Backing up bind mount {source} to {output_path}")
+                from utils.archive_utils import create_tar_gz
+                
+                # Get exclusions from config
+                exclusions = self.files_config.get('exclusions', [])
+                
+                # Create archive 
+                if create_tar_gz(source, output_path, exclusions):
+                    logger.info(f"Successfully backed up bind mount: {source}")
+                else:
+                    logger.error(f"Failed to back up bind mount: {source}")
+                    success = False
+                    
+            except Exception as e:
+                logger.error(f"Error backing up bind mount {source}: {str(e)}")
                 success = False
         
         return success

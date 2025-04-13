@@ -420,7 +420,8 @@ class DatabaseBackup:
         db_files = []
         for path in possible_paths:
             # Check if path exists before searching
-            check_cmd = f"[ -d '{path}' ] && echo 'EXISTS' || echo 'NOTFOUND'"
+            #check_cmd = f"[ -d '{path}' ] && echo 'EXISTS' || echo 'NOTFOUND'"
+            check_cmd = f"test -d {path} && echo 'EXISTS' || echo 'NOTFOUND'"
             exit_code, check_output = exec_in_container(self.container, check_cmd)
             
             if "EXISTS" in check_output:
@@ -674,7 +675,7 @@ class DatabaseBackup:
     
     def _backup_redis(self, output_path: str) -> bool:
         """
-        Back up Redis database with improved security and error handling.
+        Back up Redis database.
         
         Args:
             output_path (str): Path to store backup.
@@ -683,12 +684,10 @@ class DatabaseBackup:
             bool: True if successful, False otherwise.
         """
         # Create temporary directory for consistent backups
-        temp_dir = None
+        temp_dir = tempfile.mkdtemp(prefix="redis_backup_")
         temp_files = []
         
         try:
-            temp_dir = tempfile.mkdtemp(prefix="redis_backup_")
-            
             # Define consistent paths in container
             container_rdb = "/tmp/redis_backup.rdb"
             container_tar = "/tmp/redis_backup.tar"
@@ -707,18 +706,17 @@ class DatabaseBackup:
                     credentials[key] = self.credentials[key]
             
             # Determine backup approach based on Redis configuration
-            # First, check if RDB file is available
+            # First, check if RDB file is available - use BusyBox compatible command
             rdb_path = "/data/dump.rdb"
-            check_cmd = f"ls {rdb_path} 2>/dev/null || echo 'NOT_FOUND'"
+            check_cmd = "test -e {rdb_path} && echo 'EXISTS' || echo 'NOTFOUND'"
             exit_code, check_output = exec_in_container(self.container, check_cmd)
             
             # Flag to track if we're using RDB file or redis-cli
-            using_rdb_file = False
+            using_rdb_file = "EXISTS" in check_output
             
-            if exit_code == 0 and "NOT_FOUND" not in check_output:
+            if using_rdb_file:
                 # RDB file exists, use it for backup
                 logger.info("Using existing RDB file for Redis backup")
-                using_rdb_file = True
                 
                 # Validate RDB path
                 if not self._validate_path(rdb_path):
@@ -737,6 +735,14 @@ class DatabaseBackup:
             # If RDB not available or tar failed, use redis-cli
             if not using_rdb_file:
                 logger.info("Using redis-cli for backup")
+                
+                # Check if redis-cli is available
+                check_cmd = "which redis-cli && echo EXISTS || echo NOTFOUND"
+                exit_code, check_output = exec_in_container(self.container, check_cmd)
+                
+                if "EXISTS" not in check_output:
+                    logger.error("redis-cli not found in container")
+                    return False
                 
                 # Build redis-cli command securely
                 cmd_parts = ["redis-cli", f"--rdb {container_rdb}"]
@@ -809,7 +815,7 @@ class DatabaseBackup:
         finally:
             # Clean up in container
             if temp_files:
-                cleanup_cmd = f"rm -rf {' '.join(temp_files)}"
+                cleanup_cmd = f"rm -f {' '.join(temp_files)}"
                 exec_in_container(self.container, cleanup_cmd)
             
             # Clean up local temporary directory
