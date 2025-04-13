@@ -1,6 +1,6 @@
 FROM python:3.12-alpine
 
-ARG VERSION=1.0.18-alpha
+ARG VERSION=1.0.19-alpha
 ARG UID=80920
 ARG GID=80920
 

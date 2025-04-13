@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional, Union, Tuple
 
 # Import our modules
-from logger import configure_logging, get_logger
+from logger import configure_logging, get_logger, log_startup_info
 from config_manager import ConfigurationManager
 from portainer_client import PortainerClient
 from backup_manager import BackupManager
@@ -47,6 +47,8 @@ def initialize_components() -> Tuple[PortainerClient, ConfigurationManager, Back
     # Configure logging
     configure_logging()
     logger = get_logger(__name__)
+ 
+    log_startup_info();
     
     logger.info("Initializing Docker backup system")
     
