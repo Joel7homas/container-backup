@@ -590,67 +590,59 @@ class BackupManager:
         except Exception as e:
             logger.error(f"Error removing lock file {lock_path}: {str(e)}")
 
-    def _check_stale_locks(self) -> int:
+    def _check_stale_locks(self) -> None:
         """
-        Check for and clean up stale lock files.
+        Check for and remove stale lock files.
         
-        Returns:
-            int: Number of stale locks removed.
+        A lock is considered stale if:
+        - It's older than 3 hours
+        - The process that created it is no longer running
         """
-        try:
-            # Create lock directory if it doesn't exist
-            os.makedirs(self.lock_dir, exist_ok=True)
-            
-            stale_count = 0
-            current_time = time.time()
-            
-            # Look for lock files
-            for lock_file in self.lock_dir.glob("*.lock"):
+        logger.debug("Checking for stale locks")
+        
+        # Create lock directory if it doesn't exist
+        lock_dir = os.environ.get('LOCK_DIR', '/tmp/container-backup/locks')
+        self.lock_dir = Path(lock_dir)
+        self.lock_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Check all lock files
+        for lock_file in self.lock_dir.glob('*.lock'):
+            try:
+                with open(lock_file, 'r') as f:
+                    lock_data_str = f.read().strip()
+                    
+                # Try to parse as JSON
                 try:
-                    # Read lock file
-                    with open(lock_file, 'r') as f:
-                        lock_data_str = f.read().strip()
+                    lock_data = json.loads(lock_data_str)
+                    timestamp = lock_data.get('timestamp', 0)
+                    pid = lock_data.get('pid', 0)
+                except (json.JSONDecodeError, TypeError):
+                    # Handle old format or invalid JSON
+                    logger.warning(f"Lock file {lock_file} has invalid format, treating as stale")
+                    os.remove(lock_file)
+                    continue
                     
-                    # Parse lock data
+                # Check if lock is stale
+                current_time = time.time()
+                is_stale = current_time - timestamp > 3 * 3600  # 3 hours
+                
+                # Check if process still exists
+                process_exists = False
+                if pid > 0:
                     try:
-                        # Try parsing as JSON (new format)
-                        lock_data = json.loads(lock_data_str)
-                        lock_time = lock_data.get('timestamp', 0)
-                        lock_pid = lock_data.get('pid', 0)
-                    except (json.JSONDecodeError, AttributeError):
-                        # Old format or corrupted - treat as stale
-                        logger.warning(f"Lock file {lock_file.name} has invalid format, removing")
-                        os.remove(lock_file)
-                        stale_count += 1
-                        continue
-                    
-                    # Check if process still exists
-                    process_running = False
-                    if lock_pid > 0:
-                        try:
-                            # Skip check if it's our own process
-                            if lock_pid != os.getpid():
-                                os.kill(lock_pid, 0)
-                                process_running = True
-                        except OSError:
-                            # Process does not exist
-                            process_running = False
-                    
-                    # Check if lock is stale (older than 3 hours or process not running)
-                    if (current_time - lock_time > 3 * 3600) or not process_running:
-                        service_name = lock_data.get('service', lock_file.stem)
-                        logger.warning(f"Removing stale lock for {service_name} (PID: {lock_pid})")
-                        os.remove(lock_file)
-                        stale_count += 1
+                        if pid != os.getpid():  # Don't check our own process
+                            os.kill(pid, 0)
+                            process_exists = True
+                    except OSError:
+                        # Process does not exist
+                        pass
                         
-                except Exception as e:
-                    logger.error(f"Error checking lock file {lock_file}: {str(e)}")
-            
-            return stale_count
-            
-        except Exception as e:
-            logger.error(f"Error checking for stale locks: {str(e)}")
-            return 0
+                if is_stale or not process_exists:
+                    service_name = os.path.basename(lock_file).replace('.lock', '')
+                    logger.warning(f"Removing stale lock for {service_name} (PID: {pid})")
+                    os.remove(lock_file)
+            except Exception as e:
+                logger.error(f"Error checking lock file {lock_file}: {str(e)}")
     
     def _update_retention_config(self, services: List[ServiceBackup]) -> None:
         """

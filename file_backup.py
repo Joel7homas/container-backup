@@ -89,74 +89,62 @@ class FileBackup:
                 logger.error(f"Error during file backup: {str(e)}")
                 return False
     
-    def _backup_path(self, path: str, temp_dir: str) -> bool:
+    def _backup_path(self, path: str, output_path: str) -> bool:
         """
-        Back up a single path.
-        Handles both running and stopped containers.
+        Back up a path with improved exclusion handling.
         
         Args:
             path (str): Path to back up.
-            temp_dir (str): Temporary directory to store backup.
+            output_path (str): Path to store backup.
             
         Returns:
             bool: True if successful, False otherwise.
         """
-        logger.debug(f"Backing up path: {path}")
-        
-        # Validate path to prevent command injection
-        if not isinstance(path, str):
-            logger.error(f"Invalid path type: {type(path)}")
+        if not self._validate_path(path):
+            logger.error(f"Invalid path: {path}")
             return False
-    
-        # Check for potentially dangerous characters in path
-        if any(c in path for c in [";", "&&", "||", "`", "$", "|"]):
-            logger.error(f"Invalid characters in path: {path}")
-            return False
-    
-        # Handle root directory special case
-        if path in [".", "/"]:
-            # For root directory, use specific paths and exclusions
-            if not self.exclusions:
-                self.exclusions = [
-                    "tmp/*", "proc/*", "sys/*", "dev/*", "run/*", "var/cache/*",
-                    "var/tmp/*", "var/log/*", "var/lib/docker/*"
-                ]
             
-            # Set path to empty string for root
-            path = ""
+        # Check if path should be excluded based on exclusion patterns
+        if self._should_exclude_path(path):
+            logger.info(f"Skipping excluded path: {path}")
+            return True  # Return true as this is an expected skip, not an error
         
-        # Normalize path
-        norm_path = path.rstrip("/")
-        
-        # Check if the container is running
-        if hasattr(self.container, 'status') and self.container.status != 'running':
-            return self._backup_path_from_stopped_container(norm_path, temp_dir)
-        
-        # Check if path exists in the running container
-        check_cmd = f"[ -e '{norm_path}' ] && echo 'EXISTS' || echo 'NOT_FOUND'"
-        exit_code, output = exec_in_container(self.container, check_cmd)
-        
-        if exit_code != 0 or "NOT_FOUND" in output:
-            logger.warning(f"Path not found in container: {norm_path}")
+        try:
+            logger.debug(f"Backing up path: {path}")
+            
+            # Create temporary directory for archiving
+            with tempfile.TemporaryDirectory() as temp_dir:
+                archive_path = os.path.join(temp_dir, "archive.tar.gz")
+                
+                # Apply exclusions for tar command
+                exclusion_args = self._apply_exclusions(self.exclusions)
+                
+                # Build tar command with proper parameter handling
+                tar_cmd = ["tar", "-czf", archive_path, "-C", os.path.dirname(path)]
+                tar_cmd.extend(shlex.split(exclusion_args))
+                tar_cmd.append(os.path.basename(path))
+                
+                # Execute tar command
+                process = subprocess.run(
+                    tar_cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                
+                if process.returncode != 0:
+                    logger.error(f"Failed to create archive: {process.stderr}")
+                    return False
+                    
+                # Move archive to output location
+                shutil.copy(archive_path, output_path)
+                logger.debug(f"Successfully backed up {path} to {output_path}")
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error backing up path {path}: {str(e)}")
             return False
-        
-        # Determine if this is a volume mount
-        mounts = get_container_mounts(self.container)
-        is_volume_mount = False
-        
-        for mount in mounts:
-            container_path = mount.get("destination", "")
-            if container_path and (container_path == norm_path or 
-                                  norm_path.startswith(container_path + "/")):
-                is_volume_mount = True
-                logger.debug(f"Path {norm_path} is a volume mount")
-                break
-        
-        # Back up the path
-        if is_volume_mount:
-            return self._backup_volume_mount(norm_path, temp_dir)
-        else:
-            return self._backup_container_path(norm_path, temp_dir)
     
     def _backup_path_from_stopped_container(self, path: str, temp_dir: str) -> bool:
         """
@@ -223,6 +211,50 @@ class FileBackup:
             logger.error(f"Error backing up path {path} from stopped container {self.container.name}: {str(e)}")
             return False
     
+    def _should_exclude_path(self, path: str) -> bool:
+        """
+        Check if a path should be excluded based on exclusion patterns.
+        
+        Args:
+            path (str): Path to check.
+            
+        Returns:
+            bool: True if path should be excluded, False otherwise.
+        """
+        # Get path exclusion patterns from environment
+        exclude_paths_env = os.environ.get('EXCLUDE_MOUNT_PATHS', '')
+        exclude_patterns = []
+        
+        # Parse both comma and space separated values
+        if exclude_paths_env:
+            # Handle comma-separated list
+            for item in exclude_paths_env.split(','):
+                # Also handle space-separated items within commas
+                for pattern in item.split():
+                    if pattern:
+                        exclude_patterns.append(pattern.strip())
+        
+        # Add common patterns that should generally be excluded
+        common_excludes = [
+            '/mnt/media',
+            '/media',
+            '/backups',
+            '/mnt/backups',
+            '/cache',
+            '/tmp'
+        ]
+        
+        # Combine user-defined and common patterns
+        all_patterns = exclude_patterns + common_excludes
+        
+        # Check if path matches any exclusion pattern
+        for pattern in all_patterns:
+            if pattern in path:
+                logger.debug(f"Path {path} matches exclusion pattern: {pattern}")
+                return True
+        
+        return False
+
     def _backup_volume_mount(self, volume: str, output_dir: str) -> bool:
             """
             Back up a volume mount.
@@ -346,51 +378,40 @@ class FileBackup:
             exec_in_container(self.container, "rm -f /tmp/path_backup.tar")
             return False
     
-    def _apply_exclusions(self, path: str) -> str:
+    def _apply_exclusions(self, exclusions: List[str]) -> str:
         """
-        Apply exclusion patterns to path.
+        Apply exclusion patterns to generate tar exclude arguments.
         
         Args:
-            path (str): Path to apply exclusions to.
+            exclusions (list): List of exclusion patterns.
             
         Returns:
-            str: Tar exclusion arguments.
+            str: Arguments for tar command.
         """
-        if not self.exclusions:
-            return ""
+        # Start with empty exclusions string
+        exclusion_args = ""
         
-        # Build exclusion arguments for tar
-        exclusion_args = []
+        # If exclusions list is provided, add each exclusion
+        if exclusions:
+            for pattern in exclusions:
+                # Validate and sanitize exclusion pattern
+                if self._validate_path(pattern):
+                    # Use shlex.quote to properly escape the pattern
+                    exclusion_args += f" --exclude={shlex.quote(pattern)}"
         
-        for pattern in self.exclusions:
-            # Normalize pattern
-            pattern = pattern.replace('\\', '/')
-            
-            # Convert glob pattern to tar exclude pattern
-            if pattern.startswith('/'):
-                # Absolute path - make relative to the backup path
-                if path == "" or path == "/":
-                    # For root path, use pattern as is (without leading slash)
-                    tar_pattern = pattern[1:] if pattern.startswith('/') else pattern
-                else:
-                    # For other paths, check if pattern is within this path
-                    if pattern.startswith(path):
-                        # Pattern is within this path, make relative to it
-                        rel_pattern = pattern[len(path):]
-                        if rel_pattern.startswith('/'):
-                            rel_pattern = rel_pattern[1:]
-                        tar_pattern = rel_pattern
-                    else:
-                        # Pattern is outside this path, skip it
-                        continue
-            else:
-                # Relative path - use as is
-                tar_pattern = pattern
-            
-            # Add exclusion argument
-            exclusion_args.append(f"--exclude='{tar_pattern}'")
+        # Add global exclusions
+        global_exclusions = [
+            "*/cache/*", 
+            "*/tmp/*", 
+            "*/logs/*.log",
+            "*/backups/*",
+            "*/.git/*"
+        ]
         
-        return " ".join(exclusion_args)
+        for pattern in global_exclusions:
+            exclusion_args += f" --exclude={shlex.quote(pattern)}"
+        
+        return exclusion_args
     
     def detect_data_paths(self) -> List[str]:
         """

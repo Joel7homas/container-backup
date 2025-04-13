@@ -55,69 +55,195 @@ class ServiceBackup:
     
     def backup(self) -> bool:
         """
-        Execute full service backup.
+        Execute full service backup with configurable backup methods.
         
         Returns:
             bool: True if successful, False otherwise.
         """
-        if self.global_config.get('exclude_from_backup', False):
-            logger.info(f"Service {self.service_name} is excluded from backup")
-            return False
-        
-        # Generate timestamp for backup
+        logger.info(f"Starting backup for service: {self.service_name}")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = os.path.join("/backups", f"{self.service_name}_{timestamp}")
         
-        logger.info(f"Starting backup of service {self.service_name} to {backup_path}")
-        
-        # Create temporary staging directory
-        with tempfile.TemporaryDirectory() as temp_dir:
-            try:
-                # Determine if containers need to be stopped
-                requires_stopping = (self.db_config.get('requires_stopping', False) or 
-                                    self.files_config.get('requires_stopping', False))
+        try:
+            # Create temporary directory for backup
+            with tempfile.TemporaryDirectory() as temp_dir:
+                logger.debug(f"Created temporary directory for backup: {temp_dir}")
+                success = True
                 
-                # Stop containers if needed
+                # Determine backup method
+                backup_method = os.environ.get('BACKUP_METHOD', 'mounts').lower()
+                logger.info(f"Using backup method: {backup_method}")
+                
+                # Determine if stopping containers is required
+                requires_stopping = self.config.get('requires_stopping', False)
+                if backup_method == 'container_cp':
+                    # Container cp method may require stopping for consistency
+                    requires_stopping = True
+                
+                # Stop containers if required
                 stopped_containers = []
                 if requires_stopping:
                     stopped_containers = self._stop_containers()
+                    if not stopped_containers and len(self.containers) > 0:
+                        logger.warning("No containers were stopped, backup may be inconsistent")
                 
                 try:
-                    # Back up databases
-                    db_success = self._backup_databases(os.path.join(temp_dir, "databases"))
+                    # Backup databases
+                    if self.db_containers:
+                        logger.info(f"Backing up {len(self.db_containers)} databases")
+                        db_success = self._backup_databases(temp_dir)
+                        success = success and db_success
                     
-                    # Back up application data
-                    app_success = self._backup_app_data(os.path.join(temp_dir, "files"))
+                    # Backup application data based on backup method
+                    if backup_method == 'mounts':
+                        # Use bind mounts for backup
+                        logger.info("Using bind mounts for application data backup")
+                        app_success = self._backup_bind_mounts(temp_dir)
+                    else:  # container_cp
+                        # Use docker cp for backup
+                        logger.info("Using docker cp for application data backup")
+                        app_success = self._backup_container_data(temp_dir)
                     
-                    # Create metadata
-                    metadata_success = self._create_metadata(temp_dir, timestamp)
+                    success = success and app_success
                     
-                    # Check if any part was successful
-                    if not (db_success or app_success):
-                        logger.error(f"Backup failed for service {self.service_name}: "
-                                   f"No databases or files backed up successfully")
-                        return False
+                    # Create final archive if any data was backed up
+                    if success and (self.db_containers or backup_method != 'none'):
+                        archive_path = self._create_archive(temp_dir, timestamp)
+                        if not archive_path:
+                            logger.error("Failed to create final archive")
+                            success = False
                     
-                    # Create final archive
-                    os.makedirs(os.path.dirname(backup_path), exist_ok=True)
-                    logger.info(f"Creating final archive for service {self.service_name}")
-                    
-                    archive_path = f"{backup_path}.tar.gz"
-                    if create_tar_gz(temp_dir, archive_path):
-                        logger.info(f"Successfully created backup archive: {archive_path}")
-                        return True
-                    else:
-                        logger.error(f"Failed to create backup archive for {self.service_name}")
-                        return False
-                        
+                    return success
                 finally:
-                    # Always restart stopped containers
-                    self._start_containers(stopped_containers)
-                
-            except Exception as e:
-                logger.error(f"Error during service backup: {str(e)}")
-                return False
+                    # Always restart containers that were stopped
+                    if stopped_containers:
+                        self._start_containers(stopped_containers)
+                        
+        except Exception as e:
+            logger.error(f"Error during backup of {self.service_name}: {str(e)}")
+            return False
+
+    def _backup_bind_mounts(self, backup_dir: str) -> bool:
+        """
+        Back up bind mounts with path exclusion support.
+        
+        Args:
+            backup_dir (str): Directory to store backups.
+            
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        logger.info(f"Backing up bind mounts for service: {self.service_name}")
+        
+        # Find all unique bind mounts across containers
+        bind_mounts = self._get_unique_bind_mounts()
+        if not bind_mounts:
+            logger.warning(f"No bind mounts found for service: {self.service_name}")
+            return True
+        
+        logger.debug(f"Found {len(bind_mounts)} unique bind mounts")
+        
+        # Back up each bind mount
+        success = True
+        for mount in bind_mounts:
+            source = mount.get('Source')
+            
+            # Skip if source is empty or None
+            if not source:
+                continue
+            
+            # Create a FileBackup instance with exclusions
+            file_backup = FileBackup(
+                container=None,  # Not needed for bind mounts
+                paths=[source],
+                exclusions=self.config.get('file_exclusions', [])
+            )
+            
+            # Create output path for this mount
+            mount_name = os.path.basename(source)
+            output_path = os.path.join(backup_dir, f"mount_{mount_name}.tar.gz")
+            
+            # Backup the mount
+            mount_success = file_backup.backup(source, output_path)
+            if not mount_success:
+                logger.error(f"Failed to back up bind mount: {source}")
+                success = False
+        
+        return success
     
+    def _backup_container_data(self, backup_dir: str) -> bool:
+        """
+        Back up container data using docker cp with improved exclusion and size limits.
+        
+        Args:
+            backup_dir (str): Directory to store backups.
+            
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        logger.info(f"Backing up container data for service: {self.service_name}")
+        
+        # Check disk space before proceeding
+        if not self._check_disk_space():
+            logger.error("Insufficient disk space for container data backup")
+            return False
+        
+        # Back up each app container
+        success = True
+        for container in self.app_containers:
+            if not hasattr(container, 'name'):
+                continue
+                
+            container_name = container.name
+            logger.info(f"Backing up container data for: {container_name}")
+            
+            # Create output path for this container
+            output_path = os.path.join(backup_dir, f"container_{container_name}.tar.gz")
+            
+            # Create a FileBackup instance with exclusions
+            file_backup = FileBackup(
+                container=container,
+                paths=["/"],  # Back up entire container
+                exclusions=self.config.get('file_exclusions', [])
+            )
+            
+            # Set size limit for container backup (default 1GB)
+            max_size = int(os.environ.get('MAX_CONTAINER_BACKUP_SIZE', 1024)) * 1024 * 1024
+            file_backup.max_size = max_size
+            
+            # Backup the container
+            container_success = file_backup.backup_container(output_path)
+            if not container_success:
+                logger.error(f"Failed to back up container data for: {container_name}")
+                success = False
+        
+        return success
+    
+    def _check_disk_space(self) -> bool:
+        """
+        Check if there's enough disk space for container backup.
+        
+        Returns:
+            bool: True if enough space, False otherwise.
+        """
+        try:
+            # Get backup directory
+            backup_dir = os.environ.get('BACKUP_DIR', '/backups')
+            
+            # Check available space
+            disk_stats = os.statvfs(backup_dir)
+            available_space = disk_stats.f_frsize * disk_stats.f_bavail
+            
+            # Get minimum required space (default 5GB)
+            required_space = int(os.environ.get('MIN_REQUIRED_SPACE', 5120)) * 1024 * 1024
+            
+            logger.debug(f"Available space: {available_space / (1024*1024):.2f} MB, " +
+                         f"Required: {required_space / (1024*1024):.2f} MB")
+            
+            return available_space > required_space
+        except Exception as e:
+            logger.error(f"Error checking disk space: {str(e)}")
+            return False  # Default to False if there's an error
+
     def _identify_db_containers(self) -> List[Any]:
         """
         Identify database containers in service.
@@ -173,9 +299,7 @@ class ServiceBackup:
     
     def _stop_containers(self) -> List[Any]:
         """
-        Stop containers for consistent backup.
-        Avoids stopping the backup container itself.
-        Improves container identification with multiple methods.
+        Stop containers for consistent backup with improved exclusion handling.
         
         Returns:
             list: List of stopped container objects.
@@ -184,26 +308,12 @@ class ServiceBackup:
         stopped_containers = []
         
         try:
-            # Get the current container's identifiers
+            # Get current backup container identifiers
             current_identifiers = self._get_current_container_identifiers()
             logger.debug(f"Current container identifiers: {current_identifiers}")
             
-            # Identify critical infrastructure containers that should not be stopped
-            critical_patterns = ['flann', 'registry', 'network', 'proxy']
-            critical_containers = []
-            
-            for container in self.containers:
-                is_critical = False
-                if hasattr(container, 'name'):
-                    container_name = container.name.lower()
-                    for pattern in critical_patterns:
-                        if pattern in container_name:
-                            logger.info(f"Container {container.name} identified as critical infrastructure, will not stop")
-                            is_critical = True
-                            break
-                
-                if is_critical:
-                    critical_containers.append(container)
+            # Get stack name if available
+            stack_name = self._get_stack_name()
             
             # Stop containers in reverse order (dependencies first)
             for container in reversed(self.containers):
@@ -211,13 +321,16 @@ class ServiceBackup:
                 if self._is_current_container(container, current_identifiers):
                     logger.info(f"Skipping current container: {container.name}")
                     continue
-                    
-                # Skip critical containers
-                if container in critical_containers:
+                
+                # Check if container allows hot backup
+                hot_backup = self._check_hot_backup_support(container)
+                if hot_backup:
+                    logger.info(f"Container {container.name} supports hot backup, not stopping")
                     continue
-                    
+                
+                # Stop the container
                 if hasattr(container, 'status') and container.status == "running":
-                    logger.debug(f"Stopping container: {container.name}")
+                    logger.info(f"Stopping container: {container.name}")
                     try:
                         container.stop(timeout=30)  # Give containers 30 seconds to stop
                         stopped_containers.append(container)
@@ -236,9 +349,44 @@ class ServiceBackup:
             self._start_containers(stopped_containers)
             return []
     
+    def _check_hot_backup_support(self, container) -> bool:
+        """
+        Check if a container supports hot backup.
+        
+        Args:
+            container: Container object
+            
+        Returns:
+            bool: True if hot backup is supported, False otherwise
+        """
+        # Default to cold backup
+        if not hasattr(container, 'name') or not hasattr(container, 'labels'):
+            return False
+        
+        # Check container labels
+        labels = container.labels if isinstance(container.labels, dict) else {}
+        
+        # Check for explicit hot backup label
+        if labels.get('backup.hot', '').lower() == 'true':
+            return True
+        
+        # Check for container type that typically supports hot backup
+        image = labels.get('org.opencontainers.image.name', '')
+        if not image and hasattr(container, 'image'):
+            image = str(container.image)
+        
+        # Database containers often support hot backup
+        db_types = ['postgres', 'mysql', 'mariadb', 'mongodb', 'redis']
+        if any(db_type in image.lower() for db_type in db_types):
+            return True
+        
+        # Default to cold backup
+        return False
+    
     def _start_containers(self, containers: List[Any]) -> None:
         """
         Start containers after backup with validation and health checking.
+        Enhanced with better error handling and retry logic.
         
         Args:
             containers (list): List of container objects to start.
@@ -248,42 +396,65 @@ class ServiceBackup:
         
         logger.info(f"Starting containers for service {self.service_name}")
         
-        # Create a list to track successfully started containers
+        # Create lists to track container status
         started_containers = []
         failed_containers = []
         
-        # Start containers in original order
+        # Start containers in reverse order (dependencies last)
         for container in containers:
             try:
                 if not hasattr(container, 'name'):
                     logger.warning(f"Container object missing name attribute, skipping")
                     continue
                     
-                logger.debug(f"Starting container: {container.name}")
+                logger.info(f"Starting container: {container.name}")
                 container.start()
                 
                 # Verify container started successfully
                 start_time = time.time()
-                max_wait = 30  # Maximum seconds to wait for container to start
+                max_wait = 60  # Increased timeout for slower services
                 
                 while time.time() - start_time < max_wait:
                     # Refresh container status
                     try:
                         container.reload()
                         if container.status == "running":
+                            # Check for health status if available
+                            health = getattr(container, 'health', {})
+                            if health and isinstance(health, dict):
+                                health_status = health.get('Status', '')
+                                if health_status == 'unhealthy':
+                                    logger.warning(f"Container {container.name} is running but unhealthy")
+                                    time.sleep(2)
+                                    continue
+                                
+                            # Container is running (and healthy if health check exists)
                             started_containers.append(container)
-                            logger.debug(f"Container {container.name} started successfully")
+                            logger.info(f"Container {container.name} started successfully")
                             break
                     except Exception as e:
                         logger.warning(f"Error checking container status: {str(e)}")
                     
                     # Wait a bit before checking again
-                    time.sleep(1)
+                    time.sleep(2)
                 
                 # If container didn't start within timeout
                 if container not in started_containers:
                     logger.error(f"Container {container.name} failed to start within {max_wait} seconds")
-                    failed_containers.append(container)
+                    # Try another restart with increased timeout
+                    try:
+                        logger.info(f"Attempting another restart for {container.name}")
+                        container.restart(timeout=60)
+                        time.sleep(5)
+                        container.reload()
+                        if container.status == "running":
+                            started_containers.append(container)
+                            logger.info(f"Container {container.name} started successfully on second attempt")
+                        else:
+                            failed_containers.append(container)
+                    except Exception as e:
+                        logger.error(f"Error restarting container {container.name}: {str(e)}")
+                        failed_containers.append(container)
                     
             except Exception as e:
                 logger.error(f"Error starting container {container.name}: {str(e)}")
@@ -294,9 +465,44 @@ class ServiceBackup:
             logger.info(f"Successfully started {len(started_containers)} containers")
         
         if failed_containers:
-            logger.error(f"Failed to start {len(failed_containers)} containers: " + 
-                        ", ".join(c.name for c in failed_containers if hasattr(c, 'name')))
-
+            names = [c.name for c in failed_containers if hasattr(c, 'name')]
+            logger.error(f"Failed to start {len(failed_containers)} containers: {', '.join(names)}")
+    
+    def _container_needs_stopping(self, container):
+        """
+        Determine if a container needs to be stopped for backup.
+        
+        Args:
+            container: Container object
+            
+        Returns:
+            bool: True if container needs stopping, False otherwise
+        """
+        # If container doesn't have a name, we can't evaluate it properly
+        if not hasattr(container, 'name'):
+            return False
+            
+        container_name = container.name.lower()
+        
+        # Skip containers based on labels or service information if possible
+        if hasattr(container, 'labels'):
+            labels = container.labels if isinstance(container.labels, dict) else {}
+            
+            # Check for "hot backup" label
+            if labels.get('container-backup.hot', '').lower() == 'true':
+                logger.debug(f"Container {container_name} marked for hot backup via label")
+                return False
+                
+            # Check database containers - many support hot backup
+            db_images = ['postgres', 'mysql', 'mariadb', 'mongo', 'redis']
+            image_name = labels.get('org.opencontainers.image.name', '')
+            if any(db in image_name.lower() for db in db_images):
+                logger.debug(f"Container {container_name} identified as database, using hot backup")
+                return False
+        
+        # Default: need to stop the container for backup
+        return True
+    
     def _get_current_container_identifiers(self) -> Dict[str, str]:
         """
         Get identifiers for the current container.

@@ -129,7 +129,7 @@ class ServiceDiscovery:
         
         # Fallback: use container name as service name
         return container_name
-    
+
     def _is_excluded(self, service_name: str) -> bool:
         """
         Check if a service is excluded from backup.
@@ -140,13 +140,24 @@ class ServiceDiscovery:
         Returns:
             bool: True if excluded, False otherwise.
         """
-        # Check environment variable for excluded services
+        # Get exclusion environment variable
         exclude_env = os.environ.get('EXCLUDE_FROM_BACKUP', '')
         
-        # Split by comma and strip whitespace
+        # Initialize empty list
         excluded_services = []
+        
+        # Parse environment variable - handle multiple formats
         if exclude_env:
-            excluded_services = [s.strip().lower() for s in exclude_env.split(',') if s.strip()]
+            # First split by commas (if any)
+            comma_items = exclude_env.split(',')
+            
+            # Then handle space-separated items
+            for item in comma_items:
+                space_items = item.split()
+                excluded_services.extend([s.strip().lower() for s in space_items if s.strip()])
+        
+        # Log parsed exclusions for debugging
+        logger.debug(f"Parsed excluded services: {excluded_services}")
         
         # Check configuration for excluded services
         config = self.config_manager.get_service_config(service_name)
@@ -159,3 +170,4 @@ class ServiceDiscovery:
             logger.info(f"Service {service_name} is excluded from backup")
         
         return is_excluded
+        
