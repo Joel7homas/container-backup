@@ -403,7 +403,7 @@ class DatabaseBackup:
 
     def _backup_sqlite(self, output_path: str) -> bool:
         """
-        Back up SQLite database with improved security and error handling.
+        Back up SQLite database with improved error handling.
         
         Args:
             output_path (str): Path to store backup.
@@ -411,161 +411,132 @@ class DatabaseBackup:
         Returns:
             bool: True if successful, False otherwise.
         """
-        # Create temporary directory for consistent backups
-        temp_dir = None
-        temp_files = []
+        # Find SQLite database files with paths that typically contain databases
+        possible_paths = [
+            "/config", "/data", "/app/data", "/var/lib", "/opt", "/usr/local"
+        ]
         
-        try:
-            import tempfile
-            temp_dir = tempfile.mkdtemp(prefix="sqlite_backup_")
+        db_files = []
+        for path in possible_paths:
+            # Check if path exists before searching
+            check_cmd = f"[ -d {path} ] && echo EXISTS || echo NOTFOUND"
+            exit_code, check_output = exec_in_container(self.container, check_cmd)
             
-            # Find SQLite database files with paths that typically contain databases
-            possible_paths = [
-                "/config", "/data", "/app/data", "/var/lib", "/opt", "/usr/local"
-            ]
-            
-            db_files = []
-            for path in possible_paths:
-                # Check if path exists before searching
-                check_cmd = f"[ -d '{path}' ] && echo 'EXISTS' || echo 'NOT_FOUND'"
-                exit_code, check_output = exec_in_container(self.container, check_cmd)
-                
-                if "EXISTS" in check_output:
-                    # Search only in this path to limit permission errors
-                    find_cmd = f"find {path} -name '*.sqlite' -o -name '*.db' -o -name '*.sqlite3'"
-                    exit_code, output = exec_in_container(self.container, find_cmd)
-                    
-                    if exit_code == 0 and output.strip():
-                        # Add found files to our list
-                        db_files.extend([file for file in output.strip().split('\n') if file.strip()])
-            
-            # If no databases found in common locations, try a root search
-            if not db_files:
-                # Basic command without redirections or shell constructs
-                find_cmd = "find / -name '*.sqlite' -o -name '*.db' -o -name '*.sqlite3'"
+            if "EXISTS" in check_output:
+                # Search only in this path to limit permission errors
+                find_cmd = f"find {path} -name '*.sqlite' -o -name '*.db' -o -name '*.sqlite3'"
                 exit_code, output = exec_in_container(self.container, find_cmd)
                 
-                # Even if there are permission errors, we might still get some results
                 if output.strip():
-                    db_files.extend([file for file in output.strip().split('\n') if file.strip()])
-            
-            # If specific database specified in credentials, filter the list
-            if self.credentials.get('database') and isinstance(self.credentials['database'], str):
-                db_path = self.credentials['database']
-                # Validate database path
-                if not self._validate_path(db_path):
-                    logger.error(f"Invalid database path: {db_path}")
-                    return False
-                    
-                # Check if path exists in the list
-                matching_files = [f for f in db_files if f == db_path]
-                if matching_files:
-                    db_files = matching_files
-                else:
-                    logger.warning(f"Specified database not found: {db_path}, using discovered databases")
-            
-            if not db_files:
-                logger.error("No SQLite database files found")
-                return False            
-
-            # Use the first database file found if multiple
-            db_file = db_files[0]
-            if len(db_files) > 1:
-                logger.warning(f"Multiple SQLite databases found, using: {db_file}")
-            
+                    # Filter out error messages by checking each line
+                    for line in output.strip().split('\n'):
+                        if line and not line.startswith('find:') and not 'Permission denied' in line:
+                            db_files.append(line.strip())
+        
+        # If specific database specified in credentials, filter the list
+        if self.credentials.get('database') and isinstance(self.credentials['database'], str):
+            db_path = self.credentials['database']
             # Validate database path
-            if not self._validate_path(db_file):
-                logger.error(f"Invalid database path: {db_file}")
+            if not self._validate_path(db_path):
+                logger.error(f"Invalid database path: {db_path}")
                 return False
+                
+            # Check if path exists in the list
+            matching_files = [f for f in db_files if f == db_path]
+            if matching_files:
+                db_files = matching_files
+            else:
+                logger.warning(f"Specified database not found: {db_path}, using discovered databases")
+        
+        if not db_files:
+            logger.warning("No SQLite database files found")
+            return False
+        
+        # Check if sqlite3 is available
+        check_sqlite_cmd = "command -v sqlite3 || echo NOTFOUND"
+        exit_code, sqlite_output = exec_in_container(self.container, check_sqlite_cmd)
+        
+        if "NOTFOUND" in sqlite_output:
+            logger.warning(f"sqlite3 command not found in container {self.container.name}")
             
-            # Use consistent paths in container
-            container_temp = "/tmp/sqlite_backup"
-            container_backup_db = f"{container_temp}/backup.db"
-            container_tar = f"{container_temp}/sqlite_backup.tar"
-            
-            # Create temporary directory in container
-            mkdir_cmd = f"mkdir -p {container_temp}"
-            exit_code, _ = exec_in_container(self.container, mkdir_cmd)
-            if exit_code != 0:
-                logger.error(f"Failed to create temporary directory in container")
-                return False
-            
-            # Record for cleanup
-            temp_files.extend([container_backup_db, container_tar, container_temp])
-            
-            # Create a backup using SQLite's backup mechanism
-            # Ensure path is properly escaped and quoted for security
-            #backup_cmd = f"sqlite3 '{db_file.replace(\"'\", \"''\")}' '.backup \"{container_backup_db}\"'"
-            backup_cmd = f"""sqlite3 '{db_file.replace("'", "''")}' '.backup "{container_backup_db}"'"""
-            exit_code, output = exec_in_container(self.container, backup_cmd)
-            
-            if exit_code != 0:
-                logger.error(f"SQLite backup command failed: {output}")
-                return False
-            
-            # Create a tar archive in container
-            tar_cmd = f"tar -cf {container_tar} -C $(dirname {container_backup_db}) $(basename {container_backup_db})"
-            exit_code, _ = exec_in_container(self.container, tar_cmd)
-            
-            if exit_code != 0:
-                logger.error("Failed to create tar archive in container")
-                return False
-            
-            # Get tar data from container
-            cat_cmd = f"cat {container_tar}"
-            exit_code, tar_data = exec_in_container(self.container, cat_cmd)
-            
-            if exit_code != 0 or not tar_data:
-                logger.error("Failed to retrieve tar data from container")
-                return False
-            
-            # Write tar data to local temporary file
-            local_temp_tar = os.path.join(temp_dir, "sqlite_backup.tar")
-            with open(local_temp_tar, 'wb') as f:
-                f.write(tar_data.encode('utf-8', errors='replace'))
-            
-            # Extract SQLite file from tar
+            # Use file-based backup approach instead
+            return self._backup_sqlite_file_based(db_files[0], output_path)
+        
+        # Use the first database file found
+        db_file = db_files[0]
+        if len(db_files) > 1:
+            logger.warning(f"Multiple SQLite databases found, using: {db_file}")
+        
+        # Create a backup using SQLite3
+        with tempfile.TemporaryDirectory() as temp_dir:
             try:
-                import tarfile
-                with tarfile.open(local_temp_tar, 'r') as tar:
-                    sqlite_content = tar.extractfile(os.path.basename(container_backup_db)).read()
+                # Create temporary file path for backup
+                temp_file = os.path.join(temp_dir, "sqlite_backup.db")
+                
+                # Use .dump instead of .backup for better compatibility
+                dump_cmd = f"sqlite3 '{db_file}' '.dump' | sqlite3 /tmp/backup.db"
+                exit_code, output = exec_in_container(self.container, dump_cmd)
+                
+                if exit_code != 0:
+                    logger.error(f"Failed to dump SQLite database: {output}")
+                    
+                    # Fall back to file-based backup
+                    return self._backup_sqlite_file_based(db_file, output_path)
+                
+                # Copy the database file from the container
+                cat_cmd = "cat /tmp/backup.db"
+                exit_code, db_content = exec_in_container(self.container, cat_cmd)
+                
+                if exit_code != 0 or not db_content:
+                    logger.error("Failed to read database backup")
+                    return False
+                
+                # Compress the database content
+                with gzip.open(output_path, 'wb') as f:
+                    f.write(db_content.encode('utf-8', errors='replace'))
+                
+                # Cleanup
+                exec_in_container(self.container, "rm -f /tmp/backup.db")
+                
+                logger.info(f"SQLite backup completed successfully: {output_path}")
+                return True
+                
             except Exception as e:
-                logger.error(f"Failed to extract SQLite database from archive: {str(e)}")
+                logger.error(f"Error during SQLite backup: {str(e)}")
+                return False
+
+    def _backup_sqlite_file_based(self, db_file: str, output_path: str) -> bool:
+        """
+        Back up SQLite database using file-based approach when sqlite3 is not available.
+        
+        Args:
+            db_file (str): Path to SQLite database file.
+            output_path (str): Path to store backup.
+            
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        logger.info(f"Using file-based backup for SQLite database: {db_file}")
+        
+        try:
+            # Copy the database file from the container directly
+            cat_cmd = f"cat '{db_file}'"
+            exit_code, db_content = exec_in_container(self.container, cat_cmd)
+            
+            if exit_code != 0 or not db_content:
+                logger.error(f"Failed to read SQLite database file: {db_file}")
                 return False
             
-            # Write to temporary output file first
-            temp_output_path = f"{output_path}.tmp"
-            with gzip.open(temp_output_path, 'wb') as f:
-                f.write(sqlite_content)
+            # Compress the database content
+            with gzip.open(output_path, 'wb') as f:
+                f.write(db_content.encode('utf-8', errors='replace'))
             
-            # Atomically move to final location
-            shutil.move(temp_output_path, output_path)
-            
-            logger.info(f"SQLite backup completed successfully: {output_path}")
+            logger.info(f"SQLite file-based backup completed successfully: {output_path}")
             return True
             
         except Exception as e:
-            logger.error(f"Error during SQLite backup: {str(e)}")
-            # Attempt to cleanup temporary output file
-            if 'temp_output_path' in locals() and os.path.exists(temp_output_path):
-                try:
-                    os.remove(temp_output_path)
-                except Exception:
-                    pass
+            logger.error(f"Error during SQLite file-based backup: {str(e)}")
             return False
-            
-        finally:
-            # Clean up in container
-            if temp_files:
-                cleanup_cmd = f"rm -rf {' '.join(temp_files)}"
-                exec_in_container(self.container, cleanup_cmd)
-            
-            # Clean up local temporary directory
-            if temp_dir and os.path.exists(temp_dir):
-                try:
-                    shutil.rmtree(temp_dir)
-                except Exception as e:
-                    logger.warning(f"Failed to clean up temporary directory: {str(e)}")
     
     def _backup_mongodb(self, output_path: str) -> bool:
         """

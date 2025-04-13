@@ -457,7 +457,7 @@ def get_running_containers() -> List[Any]:
 def exec_in_container(container: Any, command: str, env: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
     """
     Execute a command in a container with robust error handling.
-    Performs validation, status checks, and handles synchronization issues.
+    Uses BusyBox-compatible command syntax.
     
     Args:
         container (Container): Docker container object.
@@ -488,7 +488,7 @@ def exec_in_container(container: Any, command: str, env: Optional[Dict[str, str]
             logger.warning(f"Error refreshing container {container.name}: {str(reload_err)}")
             # Continue anyway, as the container might still be usable
         
-        # Check if container is running
+        # Check if container is running - use busybox-compatible syntax
         if hasattr(container, 'status') and container.status != 'running':
             logger.warning(f"Container {container.name} is not running (status: {container.status})")
             
